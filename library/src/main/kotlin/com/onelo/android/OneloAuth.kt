@@ -12,6 +12,7 @@ import com.onelo.android.internal.SecureStorage
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
@@ -25,11 +26,12 @@ class OneloAuth internal constructor(
     private val config: OneloConfig,
     context: Context,
 ) {
-    private val storage = SecureStorage(context.applicationContext)
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val appContext: Context = context.applicationContext
+    private val storage = SecureStorage(appContext)
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
 
     private val _authStateFlow = MutableSharedFlow<OneloSession?>(replay = 1)
-    val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
+    internal val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
 
     private var pkceVerifier: String? = null
     private val initDeferred = CompletableDeferred<Unit>()
@@ -70,6 +72,8 @@ class OneloAuth internal constructor(
             initDeferred.complete(Unit)
         } catch (e: OneloError) {
             if (e.code == OneloError.Code.INVALID_PUBLISHABLE_KEY) isRevoked = true
+            initDeferred.complete(Unit)
+        } catch (_: Exception) {
             initDeferred.complete(Unit)
         }
     }
@@ -129,7 +133,8 @@ class OneloAuth internal constructor(
         (resp.body["app_name"] as? String)?.let { appName = it }
         (resp.body["app_logo_url"] as? String)?.let { appLogoUrl = it }
 
-        launcher.launch(Intent().putExtra(OneloAuthActivity.EXTRA_URL, hostedUrl))
+        launcher.launch(Intent(appContext, OneloAuthActivity::class.java)
+            .putExtra(OneloAuthActivity.EXTRA_URL, hostedUrl))
     }
 
     internal suspend fun exchangeCode(code: String): OneloSession {
