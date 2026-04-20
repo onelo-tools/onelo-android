@@ -4,4 +4,5 @@ import android.content.Context
 
 class Onelo(config: OneloConfig, context: Context) {
     val auth: OneloAuth = OneloAuth(config, context)
+    val features: OneloFeatures = OneloFeatures(config)
 }
