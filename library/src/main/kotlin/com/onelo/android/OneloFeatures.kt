@@ -6,7 +6,7 @@ import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 
 enum class FeatureStatus {
-    ENABLED, DISABLED, GREYED, HIDDEN, UPSELL, NEW, BETA, COMING_SOON, UNKNOWN
+    ENABLED, DISABLED, GREYED, HIDDEN, UPSELL, NEW, BETA, COMING_SOON
 }
 
 class OneloFeatureHandle(val status: FeatureStatus) {
@@ -52,7 +52,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig) {
         }
     }
 
-    fun feature(name: String): OneloFeatureHandle = OneloFeatureHandle(cache[name] ?: FeatureStatus.UNKNOWN)
+    fun feature(name: String): OneloFeatureHandle = OneloFeatureHandle(cache[name] ?: FeatureStatus.HIDDEN)
 
     fun invalidateCache() {
         cache = emptyMap()
@@ -68,6 +68,6 @@ class OneloFeatures internal constructor(private val config: OneloConfig) {
         "new"         -> FeatureStatus.NEW
         "beta"        -> FeatureStatus.BETA
         "coming_soon" -> FeatureStatus.COMING_SOON
-        else          -> FeatureStatus.UNKNOWN
+        else          -> FeatureStatus.HIDDEN
     }
 }
