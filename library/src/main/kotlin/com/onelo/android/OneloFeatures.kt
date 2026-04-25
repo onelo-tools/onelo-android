@@ -55,6 +55,11 @@ class OneloFeatures internal constructor(private val config: OneloConfig) {
         return OneloFeatureHandle(cache[name] ?: FeatureStatus.HIDDEN)
     }
 
+    fun getActiveFeatures(): List<String> =
+        cache.entries
+            .filter { (_, status) -> status == FeatureStatus.ENABLED || status == FeatureStatus.NEW || status == FeatureStatus.BETA }
+            .map { it.key }
+
     fun invalidateCache() {
         cache = emptyMap()
         configVersion = 0

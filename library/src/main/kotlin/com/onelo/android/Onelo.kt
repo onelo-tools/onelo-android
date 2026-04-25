@@ -12,6 +12,7 @@ class Onelo(config: OneloConfig, context: Context) {
 
     val auth: OneloAuth = OneloAuth(config, context)
     val features: OneloFeatures = OneloFeatures(config)
+    val feedback: OneloFeedback = OneloFeedback(config, features)
 
     init {
         Log.d("OneloBridge", "SDK initialized — features.load(null)") // TODO: remove debug
