@@ -26,7 +26,7 @@ class OneloFeatureHandle(val status: FeatureStatus) {
     }
 }
 
-class OneloFeatures internal constructor(private val config: OneloConfig) {
+class OneloFeatures internal constructor(private val config: OneloConfig, private val monitor: OneloMonitor? = null) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val mutex = Mutex()
     private var cache: Map<String, FeatureStatus> = emptyMap()
@@ -52,6 +52,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig) {
     fun feature(name: String): OneloFeatureHandle {
         val isNew = discovered.add(name)
         if (isNew) scheduleBatchPing()
+        monitor?.trackFeatureCall(name)
         return OneloFeatureHandle(cache[name] ?: FeatureStatus.HIDDEN)
     }
 

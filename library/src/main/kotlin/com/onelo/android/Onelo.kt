@@ -10,8 +10,9 @@ import kotlinx.coroutines.launch
 class Onelo(config: OneloConfig, context: Context) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
 
+    val monitor: OneloMonitor = OneloMonitor(config)
     val auth: OneloAuth = OneloAuth(config, context)
-    val features: OneloFeatures = OneloFeatures(config)
+    val features: OneloFeatures = OneloFeatures(config, monitor)
     val feedback: OneloFeedback = OneloFeedback(config, features)
 
     init {
