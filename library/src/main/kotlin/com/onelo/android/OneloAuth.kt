@@ -7,6 +7,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import com.onelo.android.internal.HttpClient
+import com.onelo.android.internal.OneloPlayIntegrity
 import com.onelo.android.internal.Pkce
 import com.onelo.android.internal.SecureStorage
 import kotlinx.coroutines.CompletableDeferred
@@ -35,6 +36,7 @@ class OneloAuth internal constructor(
 
     private var pkceVerifier: String? = null
     private val initDeferred = CompletableDeferred<Unit>()
+    private var integrityToken: String? = null
 
     var isReady = false
         private set
@@ -55,11 +57,17 @@ class OneloAuth internal constructor(
 
     private suspend fun initialize() {
         try {
+            integrityToken = OneloPlayIntegrity(
+                context = appContext,
+                apiUrl = config.apiUrl,
+                publishableKey = config.publishableKey,
+                packageName = appContext.packageName,
+            ).getIntegrityToken()
             val verifier = Pkce.generateCodeVerifier()
             pkceVerifier = verifier
             val challenge = Pkce.generateCodeChallenge(verifier)
             val url = "${config.apiUrl}/api/sdk/config?key=${enc(config.publishableKey)}&code_challenge=${enc(challenge)}"
-            val resp = HttpClient.get(url, mapOf("X-SDK-Version" to SDK_VERSION))
+            val resp = HttpClient.get(url, baseHeaders())
             if (resp.status == 401 || resp.status == 404) {
                 isRevoked = true
                 throw OneloError.invalidKey("Server rejected the key")
@@ -125,7 +133,7 @@ class OneloAuth internal constructor(
         if (isRevoked) throw OneloError.invalidKey("Application key has been revoked")
         val resp = HttpClient.get(
             "${config.apiUrl}/api/sdk/auth/initiate?key=${enc(config.publishableKey)}&callback_scheme=oneloandroid",
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         if (resp.status != 200) throw OneloError.server("Failed to initiate hosted auth flow")
         val hostedUrl = resp.body["hosted_url"] as? String
@@ -141,7 +149,7 @@ class OneloAuth internal constructor(
         val resp = HttpClient.post(
             "${config.apiUrl}/api/sdk/auth/hosted-callback",
             mapOf("publishableKey" to config.publishableKey, "code" to code),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         if (resp.status != 200) throw OneloError.server("Hosted callback failed")
         return mapSession(resp.body).also { saveSession(it) }
@@ -161,7 +169,7 @@ class OneloAuth internal constructor(
                 "publishableKey" to config.publishableKey,
                 "code_verifier" to pkceVerifier,
             ),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         if (resp.status == 403) {
@@ -186,7 +194,7 @@ class OneloAuth internal constructor(
                 "publishableKey" to config.publishableKey,
                 "code_verifier" to pkceVerifier,
             ),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         if (resp.status != 200) throw OneloError.server("Sign up failed: HTTP ${resp.status}")
@@ -225,7 +233,7 @@ class OneloAuth internal constructor(
         val resp = HttpClient.post(
             "${config.apiUrl}/api/sdk/auth/refresh",
             mapOf("publishableKey" to config.publishableKey, "refreshToken" to refreshToken),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         return when {
@@ -283,4 +291,9 @@ class OneloAuth internal constructor(
     }
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun baseHeaders(): Map<String, String> = buildMap {
+        put("X-SDK-Version", SDK_VERSION)
+        integrityToken?.let { put("X-Integrity-Token", it) }
+    }
 }

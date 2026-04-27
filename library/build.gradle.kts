@@ -28,8 +28,10 @@ android {
 dependencies {
     implementation("androidx.security:security-crypto:1.0.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3")
+    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-play-services:1.7.3")
     implementation("androidx.activity:activity-ktx:1.8.2")
     implementation("androidx.appcompat:appcompat:1.6.1")
+    implementation("com.google.android.play:integrity:1.3.0")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
