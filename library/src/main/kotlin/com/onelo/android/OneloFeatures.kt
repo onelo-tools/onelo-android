@@ -32,10 +32,11 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
     private var cache: Map<String, FeatureStatus> = emptyMap()
     private var configVersion: Int = 0
     private val discovered: MutableSet<String> = mutableSetOf()
-    var userId: String? = null
+    @Volatile var userId: String? = null
 
     private var pollJob: Job? = null
     private var pingJob: Job? = null
+    @Volatile private var securityHeaders: Map<String, String> = emptyMap()
 
     companion object {
         private const val POLL_INTERVAL_MS = 60_000L
@@ -68,8 +69,9 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
 
     // ── Internal ──────────────────────────────────────────────────────────────
 
-    internal suspend fun load(userId: String?) {
+    internal suspend fun load(userId: String?, securityHeaders: Map<String, String> = emptyMap()) {
         this.userId = userId
+        this.securityHeaders = securityHeaders
         stopPolling()
         batchPing()
         resolve()
@@ -99,7 +101,8 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
         try {
             HttpClient.post(
                 "${config.apiUrl}/api/sdk/features/batch-ping",
-                mapOf("publishableKey" to config.publishableKey, "features" to names)
+                mapOf("publishableKey" to config.publishableKey, "features" to names),
+                securityHeaders
             )
         } catch (_: Exception) {}
     }
@@ -108,7 +111,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
         try {
             val body = mutableMapOf<String, Any?>("publishableKey" to config.publishableKey)
             userId?.let { body["userId"] = it }
-            val response = HttpClient.post("${config.apiUrl}/api/sdk/features/resolve", body)
+            val response = HttpClient.post("${config.apiUrl}/api/sdk/features/resolve", body, securityHeaders)
             if (response.status !in 200..299) return
             mutex.withLock {
                 @Suppress("UNCHECKED_CAST")
@@ -128,7 +131,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
                 append("key=${config.publishableKey}&version=$configVersion")
                 userId?.let { append("&userId=$it") }
             }
-            val response = HttpClient.get("${config.apiUrl}/api/sdk/features/poll?$params")
+            val response = HttpClient.get("${config.apiUrl}/api/sdk/features/poll?$params", securityHeaders)
             if (response.status != 200) return
             val data = response.body
             if (data["changed"] == false) return
