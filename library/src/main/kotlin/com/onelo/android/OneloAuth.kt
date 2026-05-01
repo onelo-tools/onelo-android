@@ -17,8 +17,12 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
 
 class OneloAuth internal constructor(
@@ -28,6 +32,7 @@ class OneloAuth internal constructor(
     private val appContext: Context = context.applicationContext
     private val storage = SecureStorage(appContext)
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var heartbeatJob: Job? = null
 
     private val _authStateFlow = MutableSharedFlow<OneloSession?>(replay = 1)
     internal val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
@@ -243,6 +248,7 @@ class OneloAuth internal constructor(
     }
 
     suspend fun signOut() {
+        stopHeartbeat()
         storage.clear()
         notifyListeners(null)
     }
@@ -255,6 +261,31 @@ class OneloAuth internal constructor(
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
 
+    private fun startHeartbeat(accessToken: String) {
+        stopHeartbeat()
+        heartbeatJob = scope.launch {
+            while (true) {
+                delay(780_000L)
+                try {
+                    val url = URL("${config.apiUrl}/api/sdk/presence/heartbeat")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Authorization", "Bearer $accessToken")
+                    conn.connect()
+                    conn.responseCode // trigger the request
+                    conn.disconnect()
+                } catch (_: Exception) {
+                    // fire-and-forget
+                }
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
     private fun saveSession(session: OneloSession) {
         storage.set("onelo_access_token", session.accessToken)
         storage.set("onelo_refresh_token", session.refreshToken)
@@ -266,6 +297,7 @@ class OneloAuth internal constructor(
             put("tenantId", session.user.tenantId ?: "")
         }.toString())
         notifyListeners(session)
+        startHeartbeat(session.accessToken)
     }
 
     private fun notifyListeners(session: OneloSession?) {
