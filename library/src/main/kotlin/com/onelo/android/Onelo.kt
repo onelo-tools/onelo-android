@@ -16,6 +16,9 @@ class Onelo(config: OneloConfig, context: Context) {
     val auth: OneloAuth = OneloAuth(config, context)
     val features: OneloFeatures = OneloFeatures(config, monitor)
     val feedback: OneloFeedback = OneloFeedback(config, features)
+    val paywall: OneloPaywall = OneloPaywall()
+    val forms: OneloForms = OneloForms(config)
+    val waitlist: OneloWaitlist = OneloWaitlist(config)
 
     @Volatile private var attestedBundleId: String = context.packageName
     @Volatile private var integrityToken: String? = null

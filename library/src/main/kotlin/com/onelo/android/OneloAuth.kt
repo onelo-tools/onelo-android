@@ -21,8 +21,6 @@ import kotlinx.coroutines.launch
 import org.json.JSONObject
 import java.net.URLEncoder
 
-private const val SDK_VERSION = "1.0.0-staging"
-
 class OneloAuth internal constructor(
     private val config: OneloConfig,
     context: Context,
@@ -288,6 +286,24 @@ class OneloAuth internal constructor(
                 tenantId = (appMeta["tenant_id"] ?: user["tenant_id"]) as? String,
             )
         )
+    }
+
+    suspend fun sendMagicLink(email: String, redirectTo: String? = null) {
+        val body = mutableMapOf<String, Any?>(
+            "publishableKey" to config.publishableKey,
+            "email" to email,
+        )
+        if (redirectTo != null) body["redirectTo"] = redirectTo
+        HttpClient.post("${config.apiUrl}/api/sdk/auth/magic-link", body, baseHeaders())
+    }
+
+    suspend fun sendPasswordReset(email: String, redirectTo: String? = null) {
+        val body = mutableMapOf<String, Any?>(
+            "publishableKey" to config.publishableKey,
+            "email" to email,
+        )
+        if (redirectTo != null) body["redirectTo"] = redirectTo
+        HttpClient.post("${config.apiUrl}/api/sdk/auth/reset-password/request", body, baseHeaders())
     }
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
