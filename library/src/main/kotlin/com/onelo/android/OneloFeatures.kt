@@ -1,5 +1,6 @@
 package com.onelo.android
 
+import android.util.Log
 import com.onelo.android.internal.HttpClient
 import kotlinx.coroutines.*
 import kotlinx.coroutines.sync.Mutex
@@ -37,10 +38,12 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
     private var pollJob: Job? = null
     private var pingJob: Job? = null
     @Volatile private var securityHeaders: Map<String, String> = emptyMap()
+    @Volatile private var anonymousWarningLogged: Boolean = false
 
     companion object {
         private const val POLL_INTERVAL_MS = 60_000L
         private const val PING_DEBOUNCE_MS = 1_000L
+        private const val LOG_TAG = "Onelo"
     }
 
     // ── Public API ────────────────────────────────────────────────────────────
@@ -122,7 +125,29 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
                 }
                 (response.body["config_version"] as? Number)?.let { configVersion = it.toInt() }
             }
+            maybeWarnAnonymous(response.body)
         } catch (_: Exception) {}
+    }
+
+    /**
+     * Logs a one-time warning when the backend reports anonymous mode (no userId)
+     * AND at least one targeted feature was hidden purely because of it. Helps
+     * developers using their own auth system catch missing identify() calls.
+     * Suppressed via [OneloConfig.suppressIdentifyWarning].
+     */
+    private fun maybeWarnAnonymous(body: Map<String, Any?>) {
+        if (config.suppressIdentifyWarning || anonymousWarningLogged) return
+        val anonymous = body["anonymous"] as? Boolean ?: return
+        if (!anonymous) return
+        val misses = (body["targeting_misses"] as? Number)?.toInt() ?: 0
+        if (misses <= 0) return
+        anonymousWarningLogged = true
+        Log.w(
+            LOG_TAG,
+            "$misses feature(s) hidden because no user is identified.\n" +
+                "If you handle auth yourself, call onelo.identify(userId) after login so per-user/per-plan targeting can apply.\n" +
+                "If your app is intentionally anonymous, set suppressIdentifyWarning = true in OneloConfig to silence this."
+        )
     }
 
     private suspend fun poll() {
