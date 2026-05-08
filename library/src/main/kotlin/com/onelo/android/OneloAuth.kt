@@ -151,7 +151,11 @@ class OneloAuth internal constructor(
     internal suspend fun exchangeCode(code: String): OneloSession {
         val resp = HttpClient.post(
             "${config.apiUrl}/api/sdk/auth/hosted-callback",
-            mapOf("publishableKey" to config.publishableKey, "code" to code),
+            buildMap {
+                put("publishableKey", config.publishableKey)
+                put("code", code)
+                pkceVerifier?.let { put("code_verifier", it) }
+            },
             baseHeaders()
         )
         if (resp.status != 200) throw OneloError.server("Hosted callback failed")
