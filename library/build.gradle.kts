@@ -3,7 +3,7 @@ plugins {
     id("org.jetbrains.kotlin.android")
 }
 
-version = "1.7.1-staging"
+version = "1.8.0-staging"
 group = "com.github.onelo-tools"
 
 android {

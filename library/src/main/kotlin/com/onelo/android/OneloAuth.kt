@@ -33,6 +33,8 @@ class OneloAuth internal constructor(
     private val storage = SecureStorage(appContext)
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var heartbeatJob: Job? = null
+    private var refreshJob: Job? = null
+    private val refreshLeadSeconds: Long = 60
 
     private val _authStateFlow = MutableSharedFlow<OneloSession?>(replay = 1)
     internal val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
@@ -222,7 +224,7 @@ class OneloAuth internal constructor(
             return refreshSession()
         }
         val userObj = JSONObject(userJson)
-        return OneloSession(
+        val session = OneloSession(
             accessToken = accessToken,
             refreshToken = refreshToken,
             expiresAt = expiresAt,
@@ -233,6 +235,9 @@ class OneloAuth internal constructor(
                 tenantId = userObj.optString("tenantId").ifBlank { null },
             )
         )
+        // Arm background refresh on first read after process start.
+        scheduleRefresh(session)
+        return session
     }
 
     suspend fun refreshSession(): OneloSession? {
@@ -244,15 +249,16 @@ class OneloAuth internal constructor(
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         return when {
-            resp.body["error"] == "user_revoked" -> { storage.clear(); notifyListeners(null); throw OneloError.userRevoked() }
-            resp.body["error"] == "app_revoked" -> { storage.clear(); notifyListeners(null); throw OneloError.revoked() }
-            resp.status != 200 -> { storage.clear(); notifyListeners(null); null }
+            resp.body["error"] == "user_revoked" -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); throw OneloError.userRevoked() }
+            resp.body["error"] == "app_revoked" -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); throw OneloError.revoked() }
+            resp.status != 200 -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); null }
             else -> mapSession(resp.body).also { saveSession(it) }
         }
     }
 
     suspend fun signOut() {
         stopHeartbeat()
+        cancelRefreshJob()
         storage.clear()
         notifyListeners(null)
     }
@@ -290,6 +296,31 @@ class OneloAuth internal constructor(
         heartbeatJob = null
     }
 
+    /**
+     * Schedule a background refresh of the access token to fire `refreshLeadSeconds`
+     * before it expires. Idempotent — cancels any pending refresh first. Without this,
+     * an idle app would carry a stale token past its TTL and the next request would 401.
+     */
+    private fun scheduleRefresh(session: OneloSession) {
+        cancelRefreshJob()
+        val nowSec = System.currentTimeMillis() / 1000
+        val delaySec = session.expiresAt - nowSec - refreshLeadSeconds
+        val delayMs = if (delaySec > 0) delaySec * 1000 else 0L
+        refreshJob = scope.launch {
+            delay(delayMs)
+            try {
+                refreshSession()
+            } catch (_: Exception) {
+                // Errors already handled inside refreshSession (storage cleared / listeners notified).
+            }
+        }
+    }
+
+    private fun cancelRefreshJob() {
+        refreshJob?.cancel()
+        refreshJob = null
+    }
+
     private fun saveSession(session: OneloSession) {
         storage.set("onelo_access_token", session.accessToken)
         storage.set("onelo_refresh_token", session.refreshToken)
@@ -302,6 +333,7 @@ class OneloAuth internal constructor(
         }.toString())
         notifyListeners(session)
         startHeartbeat(session.accessToken)
+        scheduleRefresh(session)
     }
 
     private fun notifyListeners(session: OneloSession?) {
