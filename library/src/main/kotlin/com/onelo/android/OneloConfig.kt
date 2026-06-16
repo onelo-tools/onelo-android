@@ -11,4 +11,13 @@ data class OneloConfig(
      * if your app is intentionally anonymous. Default: false.
      */
     val suppressIdentifyWarning: Boolean = false,
+    /**
+     * Explicit Features environment selector ("test" | "live"). When set, it is
+     * forwarded on every Features request and wins over the key prefix on the
+     * backend. When null (default), the field is omitted and the backend falls
+     * back to the publishable key prefix (backward compatible). No env-var
+     * fallback on mobile — set this explicitly. Any value other than "test"/"live"
+     * normalizes to null. See docs/architecture/feature-environment-explicit.md.
+     */
+    val featureEnvironment: String? = null,
 )

@@ -40,6 +40,47 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
     @Volatile private var securityHeaders: Map<String, String> = emptyMap()
     @Volatile private var anonymousWarningLogged: Boolean = false
 
+    /** Normalized Features environment ("test"/"live") or null when unset. */
+    internal val featureEnvironment: String? = when (config.featureEnvironment?.trim()?.lowercase()) {
+        "test" -> "test"
+        "live" -> "live"
+        else   -> null
+    }
+
+    /**
+     * Builds the resolve POST body, adding `environment` only when explicitly set.
+     * Extracted for unit testing the present/absent contract.
+     */
+    internal fun resolveBody(userId: String?): Map<String, Any?> {
+        val body = mutableMapOf<String, Any?>("publishableKey" to config.publishableKey)
+        userId?.let { body["userId"] = it }
+        featureEnvironment?.let { body["environment"] = it }
+        return body
+    }
+
+    /**
+     * Builds the batch-ping POST body, adding `environment` only when explicitly set.
+     * Extracted for unit testing the present/absent contract.
+     */
+    internal fun batchPingBody(names: List<String>): Map<String, Any?> {
+        val body = mutableMapOf<String, Any?>(
+            "publishableKey" to config.publishableKey,
+            "features" to names
+        )
+        featureEnvironment?.let { body["environment"] = it }
+        return body
+    }
+
+    /**
+     * Builds the poll query string, adding `&environment=` only when explicitly set.
+     * Extracted for unit testing the present/absent contract.
+     */
+    internal fun pollParams(userId: String?, version: Int): String = buildString {
+        append("key=${config.publishableKey}&version=$version")
+        userId?.let { append("&userId=$it") }
+        featureEnvironment?.let { append("&environment=$it") }
+    }
+
     companion object {
         private const val POLL_INTERVAL_MS = 60_000L
         private const val PING_DEBOUNCE_MS = 1_000L
@@ -104,7 +145,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
         try {
             HttpClient.post(
                 "${config.apiUrl}/api/sdk/features/batch-ping",
-                mapOf("publishableKey" to config.publishableKey, "features" to names),
+                batchPingBody(names),
                 securityHeaders
             )
         } catch (_: Exception) {}
@@ -112,9 +153,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
 
     private suspend fun resolve() {
         try {
-            val body = mutableMapOf<String, Any?>("publishableKey" to config.publishableKey)
-            userId?.let { body["userId"] = it }
-            val response = HttpClient.post("${config.apiUrl}/api/sdk/features/resolve", body, securityHeaders)
+            val response = HttpClient.post("${config.apiUrl}/api/sdk/features/resolve", resolveBody(userId), securityHeaders)
             if (response.status !in 200..299) return
             mutex.withLock {
                 @Suppress("UNCHECKED_CAST")
@@ -152,10 +191,7 @@ class OneloFeatures internal constructor(private val config: OneloConfig, privat
 
     private suspend fun poll() {
         try {
-            val params = buildString {
-                append("key=${config.publishableKey}&version=$configVersion")
-                userId?.let { append("&userId=$it") }
-            }
+            val params = pollParams(userId, configVersion)
             val response = HttpClient.get("${config.apiUrl}/api/sdk/features/poll?$params", securityHeaders)
             if (response.status != 200) return
             val data = response.body
