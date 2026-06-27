@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.onelo.android.HttpClientTest" tests="4" skipped="0" failures="0" errors="0" timestamp="2026-04-15T19:40:22" hostname="MajBuk-Adi.local" time="0.003">
+  <properties/>
+  <testcase name="checkHostedFlowRequired reads nested detail error" classname="com.onelo.android.HttpClientTest" time="0.003"/>
+  <testcase name="checkHostedFlowRequired throws for hosted_flow_required error" classname="com.onelo.android.HttpClientTest" time="0.0"/>
+  <testcase name="checkHostedFlowRequired does not throw for other errors" classname="com.onelo.android.HttpClientTest" time="0.0"/>
+  <testcase name="HttpResponse data class holds status and body" classname="com.onelo.android.HttpClientTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

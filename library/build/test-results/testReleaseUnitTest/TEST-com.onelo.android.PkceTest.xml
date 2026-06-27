@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuite name="com.onelo.android.PkceTest" tests="6" skipped="0" failures="0" errors="0" timestamp="2026-04-15T19:40:23" hostname="MajBuk-Adi.local" time="0.005">
+  <properties/>
+  <testcase name="verifier is 43 base64url characters" classname="com.onelo.android.PkceTest" time="0.0"/>
+  <testcase name="challenge is stable for same verifier" classname="com.onelo.android.PkceTest" time="0.001"/>
+  <testcase name="challenge has no padding or forbidden chars" classname="com.onelo.android.PkceTest" time="0.003"/>
+  <testcase name="challenge matches RFC 7636 test vector" classname="com.onelo.android.PkceTest" time="0.0"/>
+  <testcase name="two verifiers are different" classname="com.onelo.android.PkceTest" time="0.0"/>
+  <testcase name="challenge is different from verifier" classname="com.onelo.android.PkceTest" time="0.0"/>
+  <system-out><![CDATA[]]></system-out>
+  <system-err><![CDATA[]]></system-err>
+</testsuite>

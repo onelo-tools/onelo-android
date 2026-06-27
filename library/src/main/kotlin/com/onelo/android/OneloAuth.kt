@@ -7,32 +7,41 @@ import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
 import androidx.activity.result.contract.ActivityResultContracts
 import com.onelo.android.internal.HttpClient
+import com.onelo.android.internal.OneloPlayIntegrity
 import com.onelo.android.internal.Pkce
 import com.onelo.android.internal.SecureStorage
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import org.json.JSONObject
+import java.net.HttpURLConnection
+import java.net.URL
 import java.net.URLEncoder
-
-private const val SDK_VERSION = "1.0.0-staging"
 
 class OneloAuth internal constructor(
     private val config: OneloConfig,
     context: Context,
 ) {
-    private val storage = SecureStorage(context.applicationContext)
-    private val scope = CoroutineScope(Dispatchers.Main)
+    private val appContext: Context = context.applicationContext
+    private val storage = SecureStorage(appContext)
+    private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+    private var heartbeatJob: Job? = null
+    private var refreshJob: Job? = null
+    private val refreshLeadSeconds: Long = 60
 
     private val _authStateFlow = MutableSharedFlow<OneloSession?>(replay = 1)
-    val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
+    internal val authStateFlow: SharedFlow<OneloSession?> = _authStateFlow.asSharedFlow()
 
     private var pkceVerifier: String? = null
     private val initDeferred = CompletableDeferred<Unit>()
+    private var integrityToken: String? = null
 
     var isReady = false
         private set
@@ -53,11 +62,17 @@ class OneloAuth internal constructor(
 
     private suspend fun initialize() {
         try {
+            integrityToken = OneloPlayIntegrity(
+                context = appContext,
+                apiUrl = config.apiUrl,
+                publishableKey = config.publishableKey,
+                packageName = appContext.packageName,
+            ).getIntegrityToken()
             val verifier = Pkce.generateCodeVerifier()
             pkceVerifier = verifier
             val challenge = Pkce.generateCodeChallenge(verifier)
             val url = "${config.apiUrl}/api/sdk/config?key=${enc(config.publishableKey)}&code_challenge=${enc(challenge)}"
-            val resp = HttpClient.get(url, mapOf("X-SDK-Version" to SDK_VERSION))
+            val resp = HttpClient.get(url, baseHeaders())
             if (resp.status == 401 || resp.status == 404) {
                 isRevoked = true
                 throw OneloError.invalidKey("Server rejected the key")
@@ -70,6 +85,8 @@ class OneloAuth internal constructor(
             initDeferred.complete(Unit)
         } catch (e: OneloError) {
             if (e.code == OneloError.Code.INVALID_PUBLISHABLE_KEY) isRevoked = true
+            initDeferred.complete(Unit)
+        } catch (_: Exception) {
             initDeferred.complete(Unit)
         }
     }
@@ -121,7 +138,7 @@ class OneloAuth internal constructor(
         if (isRevoked) throw OneloError.invalidKey("Application key has been revoked")
         val resp = HttpClient.get(
             "${config.apiUrl}/api/sdk/auth/initiate?key=${enc(config.publishableKey)}&callback_scheme=oneloandroid",
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         if (resp.status != 200) throw OneloError.server("Failed to initiate hosted auth flow")
         val hostedUrl = resp.body["hosted_url"] as? String
@@ -129,14 +146,19 @@ class OneloAuth internal constructor(
         (resp.body["app_name"] as? String)?.let { appName = it }
         (resp.body["app_logo_url"] as? String)?.let { appLogoUrl = it }
 
-        launcher.launch(Intent().putExtra(OneloAuthActivity.EXTRA_URL, hostedUrl))
+        launcher.launch(Intent(appContext, OneloAuthActivity::class.java)
+            .putExtra(OneloAuthActivity.EXTRA_URL, hostedUrl))
     }
 
     internal suspend fun exchangeCode(code: String): OneloSession {
         val resp = HttpClient.post(
             "${config.apiUrl}/api/sdk/auth/hosted-callback",
-            mapOf("publishableKey" to config.publishableKey, "code" to code),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            buildMap {
+                put("publishableKey", config.publishableKey)
+                put("code", code)
+                pkceVerifier?.let { put("code_verifier", it) }
+            },
+            baseHeaders()
         )
         if (resp.status != 200) throw OneloError.server("Hosted callback failed")
         return mapSession(resp.body).also { saveSession(it) }
@@ -156,7 +178,7 @@ class OneloAuth internal constructor(
                 "publishableKey" to config.publishableKey,
                 "code_verifier" to pkceVerifier,
             ),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         if (resp.status == 403) {
@@ -181,7 +203,7 @@ class OneloAuth internal constructor(
                 "publishableKey" to config.publishableKey,
                 "code_verifier" to pkceVerifier,
             ),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         if (resp.status != 200) throw OneloError.server("Sign up failed: HTTP ${resp.status}")
@@ -202,7 +224,7 @@ class OneloAuth internal constructor(
             return refreshSession()
         }
         val userObj = JSONObject(userJson)
-        return OneloSession(
+        val session = OneloSession(
             accessToken = accessToken,
             refreshToken = refreshToken,
             expiresAt = expiresAt,
@@ -213,6 +235,9 @@ class OneloAuth internal constructor(
                 tenantId = userObj.optString("tenantId").ifBlank { null },
             )
         )
+        // Arm background refresh on first read after process start.
+        scheduleRefresh(session)
+        return session
     }
 
     suspend fun refreshSession(): OneloSession? {
@@ -220,18 +245,20 @@ class OneloAuth internal constructor(
         val resp = HttpClient.post(
             "${config.apiUrl}/api/sdk/auth/refresh",
             mapOf("publishableKey" to config.publishableKey, "refreshToken" to refreshToken),
-            mapOf("X-SDK-Version" to SDK_VERSION)
+            baseHeaders()
         )
         HttpClient.checkHostedFlowRequired(resp.body)
         return when {
-            resp.body["error"] == "user_revoked" -> { storage.clear(); notifyListeners(null); throw OneloError.userRevoked() }
-            resp.body["error"] == "app_revoked" -> { storage.clear(); notifyListeners(null); throw OneloError.revoked() }
-            resp.status != 200 -> { storage.clear(); notifyListeners(null); null }
+            resp.body["error"] == "user_revoked" -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); throw OneloError.userRevoked() }
+            resp.body["error"] == "app_revoked" -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); throw OneloError.revoked() }
+            resp.status != 200 -> { cancelRefreshJob(); storage.clear(); notifyListeners(null); null }
             else -> mapSession(resp.body).also { saveSession(it) }
         }
     }
 
     suspend fun signOut() {
+        stopHeartbeat()
+        cancelRefreshJob()
         storage.clear()
         notifyListeners(null)
     }
@@ -244,6 +271,56 @@ class OneloAuth internal constructor(
 
     // ── Helpers ──────────────────────────────────────────────────────────────────
 
+    private fun startHeartbeat(accessToken: String) {
+        stopHeartbeat()
+        heartbeatJob = scope.launch {
+            while (true) {
+                delay(780_000L)
+                try {
+                    val url = URL("${config.apiUrl}/api/sdk/presence/heartbeat")
+                    val conn = url.openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.setRequestProperty("Authorization", "Bearer $accessToken")
+                    conn.connect()
+                    conn.responseCode // trigger the request
+                    conn.disconnect()
+                } catch (_: Exception) {
+                    // fire-and-forget
+                }
+            }
+        }
+    }
+
+    private fun stopHeartbeat() {
+        heartbeatJob?.cancel()
+        heartbeatJob = null
+    }
+
+    /**
+     * Schedule a background refresh of the access token to fire `refreshLeadSeconds`
+     * before it expires. Idempotent — cancels any pending refresh first. Without this,
+     * an idle app would carry a stale token past its TTL and the next request would 401.
+     */
+    private fun scheduleRefresh(session: OneloSession) {
+        cancelRefreshJob()
+        val nowSec = System.currentTimeMillis() / 1000
+        val delaySec = session.expiresAt - nowSec - refreshLeadSeconds
+        val delayMs = if (delaySec > 0) delaySec * 1000 else 0L
+        refreshJob = scope.launch {
+            delay(delayMs)
+            try {
+                refreshSession()
+            } catch (_: Exception) {
+                // Errors already handled inside refreshSession (storage cleared / listeners notified).
+            }
+        }
+    }
+
+    private fun cancelRefreshJob() {
+        refreshJob?.cancel()
+        refreshJob = null
+    }
+
     private fun saveSession(session: OneloSession) {
         storage.set("onelo_access_token", session.accessToken)
         storage.set("onelo_refresh_token", session.refreshToken)
@@ -255,6 +332,8 @@ class OneloAuth internal constructor(
             put("tenantId", session.user.tenantId ?: "")
         }.toString())
         notifyListeners(session)
+        startHeartbeat(session.accessToken)
+        scheduleRefresh(session)
     }
 
     private fun notifyListeners(session: OneloSession?) {
@@ -277,5 +356,28 @@ class OneloAuth internal constructor(
         )
     }
 
+    suspend fun sendMagicLink(email: String, redirectTo: String? = null) {
+        val body = mutableMapOf<String, Any?>(
+            "publishableKey" to config.publishableKey,
+            "email" to email,
+        )
+        if (redirectTo != null) body["redirectTo"] = redirectTo
+        HttpClient.post("${config.apiUrl}/api/sdk/auth/magic-link", body, baseHeaders())
+    }
+
+    suspend fun sendPasswordReset(email: String, redirectTo: String? = null) {
+        val body = mutableMapOf<String, Any?>(
+            "publishableKey" to config.publishableKey,
+            "email" to email,
+        )
+        if (redirectTo != null) body["redirectTo"] = redirectTo
+        HttpClient.post("${config.apiUrl}/api/sdk/auth/reset-password/request", body, baseHeaders())
+    }
+
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
+
+    private fun baseHeaders(): Map<String, String> = buildMap {
+        put("X-SDK-Version", SDK_VERSION)
+        integrityToken?.let { put("X-Integrity-Token", it) }
+    }
 }
