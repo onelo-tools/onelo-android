@@ -24,13 +24,15 @@ class OneloFeedback(private val config: OneloConfig, private val features: Onelo
         val sb = StringBuilder("${config.apiUrl}/api/sdk/feedback/initiate?key=${config.publishableKey}")
         options.type?.let { sb.append("&type=${URLEncoder.encode(it, "UTF-8")}") }
         options.area?.let { sb.append("&area=${URLEncoder.encode(it, "UTF-8")}") }
-        options.userId?.let { sb.append("&userId=${URLEncoder.encode(it, "UTF-8")}") }
         val active = features.getActiveFeatures()
         if (active.isNotEmpty()) {
             sb.append("&session=${URLEncoder.encode(JSONArray(active).toString(), "UTF-8")}")
         }
+        // userId is passed as an intent extra → sent to /initiate as a header
+        // (X-Onelo-User-Id), NOT a query param, so it never lands in the access log.
         val intent = Intent(context, OneloFeedbackActivity::class.java).apply {
             putExtra(OneloFeedbackActivity.EXTRA_INITIATE_URL, sb.toString())
+            options.userId?.let { putExtra(OneloFeedbackActivity.EXTRA_USER_ID, it) }
         }
         launcher?.launch(intent) ?: context.startActivity(intent)
     }

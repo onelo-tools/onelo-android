@@ -21,6 +21,7 @@ class OneloFeedbackActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_INITIATE_URL = "onelo_feedback_initiate_url"
+        const val EXTRA_USER_ID = "onelo_feedback_user_id"
 
         private const val SKELETON_HTML = """<!DOCTYPE html><html><head>
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -65,6 +66,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         super.onCreate(savedInstanceState)
 
         val initiateUrl = intent.getStringExtra(EXTRA_INITIATE_URL)
+        val feedbackUserId = intent.getStringExtra(EXTRA_USER_ID)
         if (initiateUrl.isNullOrBlank()) {
             setResult(Activity.RESULT_CANCELED)
             finish()
@@ -102,7 +104,20 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         // 2. Fetch hosted URL in background, navigate when ready
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                val json = URL(initiateUrl).readText()
+                // userId travels as a HEADER (X-Onelo-User-Id), not a query param,
+                // so it never appears in the access-logged initiate URL. readText()
+                // can't set headers, so use an explicit HttpURLConnection.
+                val conn = (URL(initiateUrl).openConnection() as java.net.HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 10_000
+                    readTimeout = 10_000
+                    feedbackUserId?.let { setRequestProperty("X-Onelo-User-Id", it) }
+                }
+                val json = try {
+                    conn.inputStream.bufferedReader().use { it.readText() }
+                } finally {
+                    conn.disconnect()
+                }
                 val hostedUrl = JSONObject(json).getString("hosted_url")
                 withContext(Dispatchers.Main) {
                     if (!isFinishing) webView.loadUrl(hostedUrl)
