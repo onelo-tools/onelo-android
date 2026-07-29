@@ -47,7 +47,13 @@ class OneloAuth internal constructor(
 
     private var pkceVerifier: String? = null
     private val initDeferred = CompletableDeferred<Unit>()
-    private var integrityToken: String? = null
+    // @Volatile: written in initialize() (auth's scope), read by the parent Onelo
+    // after whenReady() to reuse this attestation instead of running a second one.
+    @Volatile private var integrityToken: String? = null
+
+    /** The Play Integrity token obtained during init, or null. Call [whenReady]
+     *  first — the value is only settled once initialization completes. */
+    internal fun currentIntegrityToken(): String? = integrityToken
     @Volatile private var pendingOAuth: CompletableDeferred<String?>? = null
 
     var isReady = false
@@ -98,12 +104,11 @@ class OneloAuth internal constructor(
 
     private suspend fun initialize() {
         try {
-            integrityToken = OneloPlayIntegrity(
-                context = appContext,
-                apiUrl = config.apiUrl,
-                publishableKey = config.publishableKey,
-                packageName = appContext.packageName,
-            ).getIntegrityToken()
+            // Config FIRST: /api/sdk/config is the bootstrap call (never attestation-
+            // gated) and it tells us whether attestation is required AND the developer's
+            // Cloud project number needed by the Play Integrity Standard API. The
+            // integrity token is fetched right after, still before isReady, so
+            // baseHeaders() carries X-Integrity-Token on every subsequent auth call.
             val verifier = Pkce.generateCodeVerifier()
             pkceVerifier = verifier
             val challenge = Pkce.generateCodeChallenge(verifier)
@@ -126,6 +131,22 @@ class OneloAuth internal constructor(
             sdkRedirectUrl = resp.body["sdk_redirect_url"] as? String
             @Suppress("UNCHECKED_CAST")
             oauthProviders = (resp.body["oauth_providers"] as? List<Any?>)?.filterIsInstance<String>() ?: emptyList()
+
+            // Attestation, now that config resolved attest_required + cloud project number.
+            if (resp.body["attest_required"] as? Boolean == true) {
+                val cpn = when (val v = resp.body["cloud_project_number"]) {
+                    is Number -> v.toLong()
+                    is String -> v.toLongOrNull() ?: 0L
+                    else -> 0L
+                }
+                integrityToken = OneloPlayIntegrity(
+                    context = appContext,
+                    apiUrl = config.apiUrl,
+                    publishableKey = config.publishableKey,
+                    packageName = appContext.packageName,
+                    cloudProjectNumber = cpn,
+                ).getIntegrityToken()
+            }
             isReady = true
             initDeferred.complete(Unit)
         } catch (e: OneloError) {
@@ -357,16 +378,56 @@ class OneloAuth internal constructor(
 
     suspend fun getSession(): OneloSession? {
         initDeferred.await()
+        val stored = readStoredSession() ?: return null
+
+        if (System.currentTimeMillis() / 1000 > stored.expiresAt - 60) {
+            return refreshSession()
+        }
+        currentSession = stored
+        // Arm background refresh on first read after process start.
+        scheduleRefresh(stored)
+        return stored
+    }
+
+    /**
+     * Instant, SYNCHRONOUS presence check for a locally stored session. Unlike
+     * [getSession] it does NOT `initDeferred.await()` — no `/api/sdk/config` round-trip,
+     * no Play Integrity attestation. It is a pure EncryptedSharedPreferences read, so the
+     * host app can call it at cold-start (before [whenReady]) to immediately render its
+     * "logged-in" UI/branding while config + attestation validate in the BACKGROUND.
+     *
+     * This is a fast optimistic hint, NOT validation: it does not check expiry or
+     * revocation. Always drive real access off [getSession] (expiry → refresh, remote
+     * revoke) — that enforcement path is unchanged.
+     */
+    fun hasStoredSession(): Boolean =
+        storage.get("onelo_access_token") != null &&
+            storage.get("onelo_refresh_token") != null &&
+            storage.get("onelo_user") != null
+
+    /**
+     * The locally stored session read SYNCHRONOUSLY, WITHOUT the init/network/attest gate
+     * (no [whenReady] await, no refresh). Returns the live in-memory [currentSession] when
+     * present, else parses EncryptedSharedPreferences directly. The returned session MAY be
+     * expired — it exists for an instant cold-start "am I logged in?" read to paint UI
+     * immediately, and is the sync twin of Swift's cached-session peek. Returns null when no
+     * session is stored. For a validated session (expiry → refresh, revocation) use
+     * [getSession]; that path is unchanged and still enforces.
+     */
+    fun peekSession(): OneloSession? = currentSession ?: readStoredSession()
+
+    /**
+     * Build an [OneloSession] straight from EncryptedSharedPreferences — no network, no
+     * `initDeferred` await, no expiry check. Shared local-read core behind [getSession],
+     * [peekSession] and [hasStoredSession]. Returns null if any required token is absent.
+     */
+    private fun readStoredSession(): OneloSession? {
         val accessToken = storage.get("onelo_access_token") ?: return null
         val refreshToken = storage.get("onelo_refresh_token") ?: return null
         val userJson = storage.get("onelo_user") ?: return null
         val expiresAt = storage.get("onelo_expires_at")?.toLongOrNull() ?: 0L
-
-        if (System.currentTimeMillis() / 1000 > expiresAt - 60) {
-            return refreshSession()
-        }
         val userObj = JSONObject(userJson)
-        val session = OneloSession(
+        return OneloSession(
             accessToken = accessToken,
             refreshToken = refreshToken,
             expiresAt = expiresAt,
@@ -378,10 +439,6 @@ class OneloAuth internal constructor(
                 entitlement = OneloEntitlement.parse(userObj.optString("entitlement").ifBlank { null }),
             )
         )
-        currentSession = session
-        // Arm background refresh on first read after process start.
-        scheduleRefresh(session)
-        return session
     }
 
     suspend fun refreshSession(): OneloSession? {

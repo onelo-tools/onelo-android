@@ -7,7 +7,6 @@ import android.util.Log
 import com.onelo.android.internal.HttpClient
 import java.net.URLEncoder
 import com.onelo.android.internal.OneloEventStream
-import com.onelo.android.internal.OneloPlayIntegrity
 import com.onelo.android.internal.SecureStorage
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -70,11 +69,13 @@ class Onelo(private val config: OneloConfig, context: Context) {
         monitor.registerGlobalHandlers()
         registerSseHandlers()
         scope.launch {
-            val required = fetchAttestRequired(config)
-            if (required) {
-                val integrity = OneloPlayIntegrity(context, config.apiUrl, config.publishableKey, context.packageName)
-                integrityToken = try { integrity.getIntegrityToken() } catch (e: Exception) { null }
-            }
+            // Reuse the auth module's Play Integrity attestation instead of running
+            // a second, independent one: ONE /api/sdk/config fetch + ONE Standard-API
+            // provider warm-up per launch (the Standard prepare is rate-limited to
+            // ~5/min). auth.initialize() fetches config + (if attest_required) the
+            // integrity token before completing whenReady().
+            auth.whenReady()
+            integrityToken = auth.currentIntegrityToken()
             // Anonymous realtime kickstart so features-only apps get live updates
             // before any sign-in (re-targeted to the user when auth signs in below).
             eventStream.ensureStarted(null)
@@ -231,14 +232,4 @@ class Onelo(private val config: OneloConfig, context: Context) {
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
-
-    private suspend fun fetchAttestRequired(config: OneloConfig): Boolean {
-        return try {
-            val url = "${config.apiUrl}/api/sdk/config?key=${config.publishableKey}"
-            val resp = HttpClient.get(url)
-            resp.body["attest_required"] as? Boolean ?: false
-        } catch (e: Exception) {
-            false
-        }
-    }
 }

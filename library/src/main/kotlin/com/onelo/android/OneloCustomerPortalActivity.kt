@@ -5,6 +5,8 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.Message
 import android.view.Gravity
 import android.view.View
@@ -106,10 +108,23 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
 <div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
 </div>
 </body></html>"""
+
+        // #44 — grace period before the native fail-safe ✕ appears. A normal (fast)
+        // load posts `onelo:ready` well before this elapses, so the ✕ never flashes;
+        // it shows only if the hosted page hasn't mounted after the grace, or on a
+        // WebView load error. Mirrors Swift's 3.5s failsafe timer.
+        private const val FAILSAFE_GRACE_MS = 3_500L
     }
 
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
+    // #40 Phase 2 / #44 — native fail-safe ✕. Starts GONE; shown only after the grace
+    // period (or on load error) if the hosted page hasn't posted `onelo:ready`.
+    private lateinit var closeButton: TextView
+    private val failsafeHandler = Handler(Looper.getMainLooper())
+    private val showFailsafeRunnable = Runnable {
+        if (::closeButton.isInitialized) closeButton.visibility = View.VISIBLE
+    }
     private var resultDelivered = false
     // Default matches PORTAL_CALLBACK_SCHEME / OneloConfig.callbackScheme's default.
     private var callbackScheme: String = PORTAL_CALLBACK_SCHEME
@@ -169,17 +184,20 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             )
         )
 
-        // Neutral on-screen close affordance — a white "✕" in the top-right corner.
-        // No Onelo branding; blends into the host app. Added AFTER the WebView +
-        // ProgressBar so it sits on top and stays tappable. Hardware Back still works
-        // via onBackPressed(). The ~12dp padding gives a comfortable 44dp+ touch
-        // target. The activity uses an opaque (non-edge-to-edge) status bar
-        // (Theme.AppCompat.NoActionBar, targetSdk 34), so the container already
-        // starts below the status bar — a small edge margin is enough to avoid clipping.
+        // #40 Phase 2 — the canonical close ✕ is now rendered by the HOSTED page.
+        // This native "✕" (top-right, white, no branding) is only a FAIL-SAFE for the
+        // pre-load / load-error window when the hosted ✕ isn't on screen yet. It starts
+        // GONE and appears only after a ~3.5s grace without `onelo:ready` (#44 no-flash
+        // timing) or on a WebView load error. Added AFTER the WebView + ProgressBar so
+        // it sits on top and stays tappable. Hardware Back still works via
+        // onBackPressed(). The ~12dp padding gives a comfortable 44dp+ touch target. The
+        // activity uses an opaque (non-edge-to-edge) status bar (Theme.AppCompat
+        // .NoActionBar, targetSdk 34), so the container already starts below the status
+        // bar — a small edge margin is enough to avoid clipping.
         val density = resources.displayMetrics.density
         val touchPadding = (12 * density).toInt()
         val edgeMargin = (4 * density).toInt()
-        val closeButton = TextView(this).apply {
+        closeButton = TextView(this).apply {
             text = "✕"
             setTextColor(android.graphics.Color.WHITE)
             textSize = 22f // sp
@@ -187,6 +205,7 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             isClickable = true
             isFocusable = true
             contentDescription = "Close"
+            visibility = View.GONE // fail-safe only — armed by the grace timer below
             setOnClickListener { deliverCancelled() }
         }
         container.addView(
@@ -201,13 +220,21 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
         )
         setContentView(container)
 
+        // #44 — arm the fail-safe ✕ only after the grace period. A fast load posts
+        // `onelo:ready` first (→ cancels this), so the ✕ never flashes on screen.
+        failsafeHandler.postDelayed(showFailsafeRunnable, FAILSAFE_GRACE_MS)
+
         webView.webViewClient = OneloCustomerPortalWebViewClient(
             callbackScheme = callbackScheme,
             onDone = { event -> deliverDone(event) },
             onCode = { code -> deliverCode(code) },
             onExternalOpen = { uri -> openInBrowser(uri) },
             onPageFinished = { progressBar.visibility = View.GONE },
-            onError = { deliverCancelled() },
+            // Hosted page failed to load → its canonical ✕ will never appear. Surface
+            // the native fail-safe ✕ immediately so the user can still dismiss (mirrors
+            // Swift's error → fail-safe ✕). Portal dismiss stays on `source=portal`.
+            // (`onelo:ready` → hideFailsafe is delivered via the OneloAndroid JS bridge.)
+            onError = { showFailsafe(); progressBar.visibility = View.GONE },
         )
 
         // = OneloAuthActivity.onCreateWindow. The hosted store `window.open`s the
@@ -252,7 +279,20 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
         } catch (_: Exception) { /* no browser — best effort */ }
     }
 
+    /** #44 — reveal the native fail-safe ✕ (and cancel the pending grace-timer show). */
+    private fun showFailsafe() {
+        failsafeHandler.removeCallbacks(showFailsafeRunnable)
+        if (::closeButton.isInitialized) closeButton.visibility = View.VISIBLE
+    }
+
+    /** #40 Phase 2 — hide the native fail-safe ✕ once the hosted ✕ owns the affordance. */
+    private fun hideFailsafe() {
+        failsafeHandler.removeCallbacks(showFailsafeRunnable)
+        if (::closeButton.isInitialized) closeButton.visibility = View.GONE
+    }
+
     override fun onDestroy() {
+        failsafeHandler.removeCallbacks(showFailsafeRunnable)
         // Release the external-return hook, but only if it's still ours (a newer
         // OneloCustomerPortalActivity may have replaced it).
         if (!isChangingConfigurations) pendingExternalReturn = null
@@ -304,6 +344,16 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             runOnUiThread { deliverCode(code) }
         }
 
+        /**
+         * #40 Phase 2 — hosted portal mounted (`onelo:ready`) → hide the native fail-safe
+         * ✕ and cancel the pending grace-timer show, so the hosted page's canonical ✕
+         * owns the affordance.
+         */
+        @JavascriptInterface
+        fun onReady() {
+            runOnUiThread { hideFailsafe() }
+        }
+
         @JavascriptInterface
         fun onCancelled() {
             // A store cancel inside the portal shouldn't tear the portal down — the
@@ -328,7 +378,8 @@ private class OneloCustomerPortalWebViewClient(
     override fun onPageFinished(view: WebView?, url: String?) {
         onPageFinished()
         // Inject the store's postMessage relay (same protocol as OneloAuthActivity) so
-        // a "Change plan" card that reports success via `onelo:code` reaches us.
+        // a "Change plan" card that reports success via `onelo:code` reaches us, PLUS
+        // the #40 Phase 2 `onelo:ready` signal that hides the native fail-safe ✕.
         view?.evaluateJavascript(
             """
             (function() {
@@ -339,6 +390,8 @@ private class OneloCustomerPortalWebViewClient(
                         var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
                         if (data && data.type === 'onelo:code' && data.code) {
                             OneloAndroid.onCode(data.code);
+                        } else if (data && data.type === 'onelo:ready') {
+                            OneloAndroid.onReady();
                         }
                     } catch(err) {}
                 });
