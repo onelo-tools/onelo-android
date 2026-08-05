@@ -16,6 +16,37 @@ import android.widget.FrameLayout
 import android.widget.ProgressBar
 import androidx.appcompat.app.AppCompatActivity
 
+/**
+ * True when [url] is an OAuth navigation that MUST leave the embedded WebView.
+ *
+ * Two shapes qualify:
+ *  - the Onelo init route `/api/sdk/auth/oauth/{google|github|apple}`, which the
+ *    hosted page navigates to and which 302s onward to the provider. Catching it
+ *    here means the whole redirect chain runs in the browser, preserving the
+ *    user's provider SSO cookies.
+ *  - the provider authorization hosts themselves, as a backstop for any path we
+ *    did not anticipate.
+ *
+ * Deliberately plain-Kotlin (java.net.URI, not android.net.Uri) so the navigation
+ * policy is unit-testable on the JVM without Robolectric. Mirrors Electron's
+ * `isOAuthProviderUrl` and RN's `isOAuthNavigation`.
+ */
+internal fun isOneloOAuthUrl(url: String): Boolean {
+    val parsed = try { java.net.URI(url) } catch (_: Exception) { return false }
+    val scheme = parsed.scheme?.lowercase() ?: return false
+    if (scheme != "http" && scheme != "https") return false
+    val host = parsed.host?.lowercase() ?: ""
+    if (host == "accounts.google.com" || host == "github.com" || host == "appleid.apple.com") {
+        return true
+    }
+    val path = parsed.path?.lowercase() ?: ""
+    // Exact segment match — `/api/sdk/auth/oauth/hosted-init` is a token hand-off
+    // consumed server-side, NOT a navigation to divert.
+    return path == "/api/sdk/auth/oauth/google" ||
+        path == "/api/sdk/auth/oauth/github" ||
+        path == "/api/sdk/auth/oauth/apple"
+}
+
 class OneloAuthActivity : AppCompatActivity() {
 
     companion object {
@@ -112,6 +143,30 @@ class OneloAuthActivity : AppCompatActivity() {
                     val code = uri.getQueryParameter("code")
                     if (!code.isNullOrBlank()) deliverCode(code) else deliverCancelled()
                     return true // consume — never let the WebView load the unknown scheme
+                }
+                // SOCIAL SIGN-IN → system browser. Google and Apple sniff the
+                // User-Agent and refuse embedded WebViews outright ("this browser
+                // is not secure" / disallowed_useragent), and GitHub leaves the
+                // user without their saved session, so re-entering creds + 2FA
+                // every time. Without this branch the WebView happily loaded
+                // accounts.google.com and the sign-in dead-ended. Mirrors Flutter
+                // `_providerFromUrl`, RN `isOAuthNavigation` and Electron
+                // `isOAuthProviderUrl` — Android was the only UI SDK missing it.
+                //
+                // We divert the whole chain to the browser rather than just the
+                // provider page, so the provider sees a real browser from the
+                // first hop. The flow returns to the app as `<scheme>://callback
+                // ?code=…`, which the host app forwards through
+                // Onelo.handleRedirect → pendingExternalReturn → deliverCode —
+                // the exact path the external Stripe card page already uses.
+                if (isOneloOAuthUrl(uri.toString())) {
+                    try {
+                        startActivity(
+                            Intent(Intent.ACTION_VIEW, uri)
+                                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                        )
+                    } catch (_: Exception) { /* no browser — best effort */ }
+                    return true
                 }
                 // THE CARD PAGE → system browser. It's reached via a TOP-LEVEL nav
                 // (window.location.href), not window.open, so onCreateWindow never
