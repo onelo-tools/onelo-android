@@ -22,7 +22,7 @@ class Onelo(private val config: OneloConfig, context: Context) {
     // into EVERY module that hits a bundle-enforcing endpoint, so a live app with a
     // registered bundle isn't 403'd. The lambda is lazy — invoked per-request (post-init),
     // so it safely reads instanceId/attestedBundleId/integrityToken declared below.
-    val monitor: OneloMonitor = OneloMonitor(config, context) { securityHeaders() }
+    val monitor: OneloMonitor = OneloMonitor(config, context, securityHeaders = { securityHeaders() })
     val auth: OneloAuth = OneloAuth(config, context) { securityHeaders() }
     val features: OneloFeatures = OneloFeatures(config, monitor, context)
     val feedback: OneloFeedback = OneloFeedback(config, features) { securityHeaders() }

@@ -12,7 +12,7 @@ plugins {
 // namespace verified on central.sonatype.com). `version` is the line the Publish
 // SDK / Release workflows grep, so keep the `version = "…"` shape.
 group = "tools.onelo"
-version = "1.33.0"
+version = "1.35.0"
 
 android {
     namespace = "com.onelo.android"
@@ -46,6 +46,12 @@ dependencies {
     implementation("com.google.android.play:integrity:1.3.0")
 
     testImplementation("junit:junit:4.13.2")
+    // Real org.json on the unit-test classpath. The android.jar bundled with the
+    // JVM test runtime is a STUB whose every method throws "not mocked", so code
+    // that builds a JSONObject (the monitor's batch payload) silently takes its
+    // error path instead of running. This makes the transport tests exercise the
+    // real encode → send path.
+    testImplementation("org.json:json:20231013")
     testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.7.3")
 }
 
