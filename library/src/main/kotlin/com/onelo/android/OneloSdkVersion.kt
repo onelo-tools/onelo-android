@@ -1,3 +1,3 @@
 package com.onelo.android
 
-internal const val SDK_VERSION = "1.35.0-staging"
+internal const val SDK_VERSION = "1.36.0-staging"

@@ -57,6 +57,11 @@ class Onelo(private val config: OneloConfig, context: Context) {
     fun securityHeaders(): Map<String, String> {
         val headers = mutableMapOf<String, String>()
         headers["X-Onelo-Instance-Id"] = instanceId
+        // WHICH OS. Always "android" here, and always accurate — which is the
+        // point: /api/sdk/config suppresses the "Require plan on sign-up" gate
+        // ONLY for Apple platforms, so a client that positively identifies as
+        // Android can never be caught by that branch by accident.
+        headers["X-Onelo-OS"] = "android"
         if (attestedBundleId.isNotEmpty()) headers["X-Bundle-Id"] = attestedBundleId
         integrityToken?.let { headers["X-Integrity-Token"] = it }
         return headers
