@@ -12,7 +12,7 @@ plugins {
 // namespace verified on central.sonatype.com). `version` is the line the Publish
 // SDK / Release workflows grep, so keep the `version = "…"` shape.
 group = "tools.onelo"
-version = "1.39.1"
+version = "1.39.2"
 
 android {
     namespace = "com.onelo.android"
@@ -58,10 +58,20 @@ dependencies {
 mavenPublishing {
     // Central Portal (the OSSRH successor). vanniktech 0.34.0's argument-less
     // publishToMavenCentral() already targets the Central Portal — the SonatypeHost
-    // enum was removed by 0.34.0, so there is nothing to pass. Credentials + GPG come
-    // from mavenCentralUsername/Password + signingInMemoryKey* (set in CI as
-    // ORG_GRADLE_PROJECT_* env vars — never committed).
-    publishToMavenCentral()
+    // enum was removed by 0.34.0, so there is nothing to pass for WHICH host.
+    // Credentials + GPG come from mavenCentralUsername/Password +
+    // signingInMemoryKey* (set in CI as ORG_GRADLE_PROJECT_* env vars — never
+    // committed).
+    //
+    // `true` = automaticRelease. Without it, this call only STAGES + VALIDATES the
+    // deployment on the Central Portal and leaves it sitting in "pending" — a
+    // human still has to open central.sonatype.com/publishing/deployments and
+    // click Publish. release-android.yml already printed "✅ Published" on every
+    // run regardless (the Gradle task succeeded), so this sat undetected for a
+    // week: five green releases (1.36.0 → 1.39.1) queued up, and Maven Central
+    // never moved past the one version someone happened to click through by hand
+    // on 2026-08-14 (found 2026-08-20 while chasing a magic-link SDK bug).
+    publishToMavenCentral(true)
     signAllPublications()
 
     coordinates(group.toString(), "onelo-android", version.toString())
