@@ -22,6 +22,16 @@ data class OneloUser(
     val tenantId: String?,
     /** Paid-access entitlement, returned on every auth response's `user` object. */
     val entitlement: OneloEntitlement = OneloEntitlement.NONE,
+    /**
+     * Server-computed Access Gate answer (`user.allowed_in` from the backend) — is
+     * THIS caller allowed into the app right now? Null on an older backend that
+     * doesn't send the field yet; [OneloAuth.isAllowedIn] falls back to the local
+     * derivation only in that case. Never compute `!paywallEnabled ||
+     * entitlement == ACTIVE` yourself — that rule lived in three other SDKs and
+     * was found wrong in each on a different day (2026-08-18). Contract:
+     * docs/sdk-access-gate-wiring.md.
+     */
+    val allowedIn: Boolean? = null,
 )
 
 data class OneloSession(

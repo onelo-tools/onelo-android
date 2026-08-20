@@ -79,7 +79,18 @@ class OneloPaywall(
         // which 403s a live mobile app without X-Bundle-Id (parity with Swift).
         headers.putAll(securityHeaders())
         val resp = HttpClient.get(url, headers)
-        if (resp.status != 200) throw OneloError.server("store-initiate failed: HTTP ${resp.status}")
+        if (resp.status != 200) {
+            val code = extractErrorCode(resp.body)
+            if (code == "in_app_store_not_allowed") {
+                throw OneloError.inAppStoreNotAllowed(
+                    extractErrorMessage(resp.body)
+                        ?: "[in_app_store_not_allowed] The in-app store is not available for this app.",
+                )
+            }
+            throw OneloError.server(
+                "store-initiate failed: HTTP ${resp.status}" + (code?.let { " ($it)" } ?: ""),
+            )
+        }
         return resp.body["store_url"] as? String
             ?: throw OneloError.server("store-initiate response missing store_url")
     }
@@ -121,8 +132,8 @@ class OneloPaywall(
         )
 
         if (resp.status !in 200..299) {
-            val msg = (resp.body["error"] as? String)
-                ?: (resp.body["detail"] as? String)
+            val msg = extractErrorMessage(resp.body)
+                ?: extractErrorCode(resp.body)
                 ?: "cancel subscription failed (HTTP ${resp.status})"
             throw OneloError.server(msg)
         }

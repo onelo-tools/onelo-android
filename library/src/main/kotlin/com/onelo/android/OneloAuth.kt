@@ -99,6 +99,7 @@ class OneloAuth internal constructor(
     init {
         require(config.apiUrl.isNotBlank()) { "[Onelo] apiUrl is required" }
         require(config.publishableKey.isNotBlank()) { "[Onelo] publishableKey is required" }
+        requireSecureApiUrl(config.apiUrl)
         scope.launch { initialize() }
     }
 
@@ -199,9 +200,218 @@ class OneloAuth internal constructor(
      * Open the hosted sign-in page in OneloAuthActivity.
      * The result is delivered to the launcher registered via [registerLauncher].
      */
-    suspend fun loadAuthView(launcher: ActivityResultLauncher<Intent>) {
+    /**
+     * Returns the current session when the backend answered `authorized` — i.e.
+     * NOTHING was launched, because this caller already has access.
+     *
+     * That return value is load-bearing. The documented pattern is: register a
+     * launcher, call this, and treat the launcher callback as "signed in". On the
+     * `authorized` path the launcher callback NEVER fires, so a host app that
+     * ignored the return value would show a button that does nothing for an
+     * already-entitled user. `null` means a UI was launched and the result will
+     * arrive through the launcher, exactly as before.
+     */
+    suspend fun loadAuthView(launcher: ActivityResultLauncher<Intent>): OneloSession? {
         initDeferred.await()
         if (isRevoked) throw OneloError.invalidKey("Application key has been revoked")
+
+        return when (val decision = resolveFlow()) {
+            is FlowDecision.Authorized -> {
+                // Reconcile the local entitlement so `hasActiveAccess` agrees with
+                // the server before the host app gates its UI on it.
+                if (paywallEnabled) revalidateEntitlement()
+                currentSession
+            }
+            is FlowDecision.Present -> {
+                // Remember WHERE Onelo hosts this app's surfaces, so a `gate` value
+                // arriving later over the deep-link scheme (any app on the device can
+                // fire that scheme) can be checked against a known-good origin before
+                // it's loaded into a WebView. Parity with Swift's `_rememberHostedOrigin`.
+                rememberHostedOrigin(decision.url)
+                // Lets the Activity recover when the hosted page hands control back
+                // with `?error=invalid_token` (sign-out from the no-plan page, or an
+                // idle expiry) instead of closing the auth window on the user.
+                OneloAuthActivity.pendingFreshUrl = {
+                    (resolveFlow() as? FlowDecision.Present)?.url
+                }
+                launcher.launch(Intent(appContext, OneloAuthActivity::class.java)
+                    .putExtra(OneloAuthActivity.EXTRA_URL, decision.url)
+                    .putExtra(OneloAuthActivity.EXTRA_SCHEME, config.callbackScheme))
+                null
+            }
+        }
+    }
+
+    /** Record the origin serving this app's hosted surfaces, as told by the backend.
+     *  Never parsed out of a value that arrived from outside. Parity with Swift's
+     *  `_rememberHostedOrigin` / Electron's `rememberHostedOrigin`. */
+    private fun rememberHostedOrigin(url: String) {
+        val host = oneloHostedOriginHost(url) ?: return
+        storage.set(HOSTED_ORIGIN_KEY, host)
+    }
+
+    /**
+     * Is this URL one of Onelo's own hosted surfaces for this app?
+     *
+     * Fails CLOSED: an unknown origin, a non-https URL, or no remembered origin at
+     * all all answer false. A `gate` refusal deep link carries a URL that ANY app on
+     * the device can hand us over the registered scheme, and it goes on to be loaded
+     * in a WebView — so an unchecked value here is a phishing page wearing the app's
+     * own sign-in window. Parity with Swift's `_isOneloHostedSurface`.
+     */
+    internal fun isOneloHostedSurface(url: String): Boolean {
+        val host = oneloHostedOriginHost(url) ?: return false
+        val known = listOfNotNull(
+            storage.get(HOSTED_ORIGIN_KEY),
+            storeUrl?.let { oneloHostedOriginHost(it) },
+            manageUrl?.let { oneloHostedOriginHost(it) },
+        )
+        return known.contains(host)
+    }
+
+    /** What the backend says should happen next. Mirrors Swift `FlowDecision`. */
+    sealed class FlowDecision {
+        /** Already entitled — show your content, open nothing. */
+        object Authorized : FlowDecision()
+        /** Open [url]; [surface] is `sign_in`, `store` or `no_plan` (informational). */
+        data class Present(val surface: String, val url: String) : FlowDecision()
+    }
+
+    /**
+     * Ask the backend for the single next step (`GET /api/sdk/flow/init`).
+     *
+     * ── Why this replaced the direct /auth/initiate call ─────────────────────
+     * `/auth/initiate` answers one question: "give me a sign-in page". It cannot
+     * say "this user has no plan" or "send them to the store", because those need
+     * the caller's identity. So this SDK could only ever open a sign-in form, and
+     * the routing was left to whatever the host app improvised.
+     *
+     * `/flow/init` makes that decision ONCE, server-side, for every SDK — and it
+     * owns the App Store 3.1.1 gate: the in-app store is withheld on Apple
+     * platforms unless the developer opted in (Paywall → Access Gate). Android
+     * itself is never an Apple platform, but the same endpoint is what produces
+     * the honest `no_plan` surface for a signed-in user with no plan, instead of
+     * a sign-in form they have already completed.
+     *
+     * Falls back to the legacy `/auth/initiate` ONLY on 404/405 (a backend that
+     * predates the endpoint). A 403 or any other error is surfaced: papering a
+     * rejected device over with a sign-in form hides the real problem.
+     *
+     * Mirrors Swift `resolveFlow`, RN `_decisionFromFlow`, JS/Electron `resolveFlow`.
+     */
+    suspend fun resolveFlow(lang: String? = null): FlowDecision {
+        val langParam = lang?.let { "&lang=${enc(it)}" } ?: ""
+        val resp = HttpClient.get(
+            "${config.apiUrl}/api/sdk/flow/init?key=${enc(config.publishableKey)}" +
+                "&callback_scheme=${enc(config.callbackScheme)}$langParam",
+            // Bearer when signed in — without it the backend can only ever answer
+            // "sign_in", which is exactly the blindness this replaces.
+            baseHeaders(bearer = currentSession?.accessToken)
+        )
+
+        val decision = decisionFromFlow(resp.status, resp.body)
+        if (decision == null) return legacyInitiate()
+
+        (resp.body["app_name"] as? String)?.let { appName = it }
+        (resp.body["app_logo_url"] as? String)?.let { appLogoUrl = it }
+        return decision
+    }
+
+    companion object {
+        /** Storage key for [rememberHostedOrigin] / [isOneloHostedSurface]. */
+        private const val HOSTED_ORIGIN_KEY = "onelo_hosted_origin"
+
+        /**
+         * Reject a plaintext `apiUrl`. Every request this SDK makes carries
+         * credentials — the access token, the publishable key, the integrity
+         * token — so over `http://` they are readable by anyone on the same
+         * network. `apiUrl` was previously only checked for non-blankness, and
+         * "I'll switch it back before release" is exactly the kind of thing that
+         * ships.
+         *
+         * Loopback AND private network ranges are allowed. Loopback alone would be
+         * too strict to be workable: a developer testing on a PHYSICAL phone
+         * cannot reach their machine at `localhost`, they must use its LAN
+         * address. That traffic stays on the local network, so the exposure this
+         * guards against — anyone on the path to a public host — does not apply.
+         */
+        internal fun requireSecureApiUrl(apiUrl: String) {
+            val lower = apiUrl.trim().lowercase()
+            if (lower.startsWith("https://")) return
+            val host = lower.removePrefix("http://").substringBefore('/').substringBefore(':')
+            require(isLocalHost(host)) {
+                "[Onelo] apiUrl must use https:// — got \"$apiUrl\". Every Onelo request " +
+                    "carries credentials (access token, publishable key), which plaintext " +
+                    "http exposes to anyone on the network. localhost / 10.0.2.2 are allowed " +
+                    "for local development."
+            }
+        }
+
+        /** Loopback, the emulator's host alias, and the RFC 1918 private ranges. */
+        private fun isLocalHost(host: String): Boolean {
+            if (host == "localhost" || host == "127.0.0.1" || host == "::1") return true
+            val octets = host.split(".").mapNotNull { it.toIntOrNull() }
+            if (octets.size != 4 || host.split(".").size != 4) return false
+            if (octets.any { it < 0 || it > 255 }) return false
+            val (a, b) = octets[0] to octets[1]
+            // 10.0.0.0/8 (covers the emulator's 10.0.2.2), 192.168.0.0/16, 172.16.0.0/12.
+            return a == 10 || (a == 192 && b == 168) || (a == 172 && b in 16..31)
+        }
+
+        /**
+         * Map a `/flow/init` response to a decision. **`null` means — and only
+         * means — "this backend has no such endpoint, use the legacy path".**
+         *
+         * Split out as a pure function so the routing rules are actually
+         * testable: `HttpClient` is an object with a direct `openConnection`, and
+         * `OneloAuth` needs a `Context`, so nothing here could be exercised
+         * through the public method without adding Robolectric. The rules below
+         * are the part that regresses silently, so they get real coverage.
+         * Mirrors RN `_decisionFromFlow`.
+         *
+         * Only 404/405 fall back. Every other failure THROWS, deliberately:
+         * quietly retrying a 403 (revoked device, bundle mismatch, bad
+         * attestation) on `/auth/initiate` would hand the user a sign-in form and
+         * hide the real reason. A 2xx with an unrecognised shape is a broken
+         * contract, not an absent endpoint, so it throws too.
+         */
+        /**
+         * The Access Gate answer, isolated from session/storage lookup so it's
+         * unit-testable without Robolectric — mirrors `decisionFromFlow` above.
+         * `allowedIn == null` means the backend hasn't sent the field yet
+         * (compatibility fallback only); any non-null value from the server
+         * wins outright, never re-derived from `paywallEnabled`/`entitlement`.
+         */
+        internal fun allowedInDecision(allowedIn: Boolean?, paywallEnabled: Boolean, entitlement: OneloEntitlement): Boolean {
+            if (allowedIn != null) return allowedIn
+            return !paywallEnabled || entitlement == OneloEntitlement.ACTIVE
+        }
+
+        internal fun decisionFromFlow(status: Int, body: Map<String, Any?>): FlowDecision? {
+            if (status == 404 || status == 405) return null
+            if (status !in 200..299) {
+                val detail = body["detail"] as? String
+                    ?: body["error"] as? String
+                    ?: "HTTP $status"
+                throw OneloError.server("Failed to resolve auth flow: $detail")
+            }
+            return when (body["action"] as? String) {
+                "authorized" -> FlowDecision.Authorized
+                "present" -> {
+                    val url = (body["url"] as? String)?.takeIf { it.isNotBlank() }
+                        ?: throw OneloError.server("Invalid flow response")
+                    // `surface` is carried verbatim and never branched on — the SDK
+                    // opens what it is handed, so a surface added server-side later
+                    // must round-trip untouched rather than throw.
+                    FlowDecision.Present((body["surface"] as? String).orEmpty(), url)
+                }
+                else -> throw OneloError.server("Invalid flow response")
+            }
+        }
+    }
+
+    /** Pre-/flow/init backends only. Always a sign-in page — see [resolveFlow]. */
+    private suspend fun legacyInitiate(): FlowDecision {
         val resp = HttpClient.get(
             "${config.apiUrl}/api/sdk/auth/initiate?key=${enc(config.publishableKey)}&callback_scheme=${enc(config.callbackScheme)}",
             baseHeaders()
@@ -211,10 +421,7 @@ class OneloAuth internal constructor(
             ?: throw OneloError.server("Invalid initiate response")
         (resp.body["app_name"] as? String)?.let { appName = it }
         (resp.body["app_logo_url"] as? String)?.let { appLogoUrl = it }
-
-        launcher.launch(Intent(appContext, OneloAuthActivity::class.java)
-            .putExtra(OneloAuthActivity.EXTRA_URL, hostedUrl)
-            .putExtra(OneloAuthActivity.EXTRA_SCHEME, config.callbackScheme))
+        return FlowDecision.Present("sign_in", hostedUrl)
     }
 
     internal suspend fun exchangeCode(code: String): OneloSession {
@@ -437,6 +644,7 @@ class OneloAuth internal constructor(
                 role = userObj.optString("role").ifBlank { "member" },
                 tenantId = userObj.optString("tenantId").ifBlank { null },
                 entitlement = OneloEntitlement.parse(userObj.optString("entitlement").ifBlank { null }),
+                allowedIn = if (userObj.has("allowedIn")) userObj.getBoolean("allowedIn") else null,
             )
         )
     }
@@ -528,13 +736,41 @@ class OneloAuth internal constructor(
         }
         if (resp.status != 200) return session.user.entitlement
         val entitlement = OneloEntitlement.parse(resp.body["entitlement"])
-        if (entitlement != session.user.entitlement) {
-            val updated = session.copy(user = session.user.copy(entitlement = entitlement))
+        // Persist the ANSWER too, not only the ingredient. Refreshing entitlement
+        // alone left a paying customer holding a stored allowedIn=false — locked
+        // out by the very call meant to let them in (found in JS/Swift/Flutter/
+        // Electron, 2026-08-19). Absent stays null so isAllowedIn's fallback applies.
+        val allowedIn = resp.body["allowed_in"] as? Boolean ?: session.user.allowedIn
+        if (entitlement != session.user.entitlement || allowedIn != session.user.allowedIn) {
+            val updated = session.copy(user = session.user.copy(entitlement = entitlement, allowedIn = allowedIn))
             currentSession = updated
             storage.set("onelo_user", userJson(updated.user))
             notifyListeners(updated)
         }
         return entitlement
+    }
+
+    /**
+     * May this person see the app?
+     *
+     * READ from the server, never computed here. The rule `!paywallEnabled ||
+     * entitlement == ACTIVE` once lived in this SDK's sibling SDKs (JS, Swift,
+     * Electron) — three copies, each found wrong on a different day. The JS copy
+     * answered `true` while its config was still loading, so a plan-less user
+     * walked into a paid app on every page load (2026-08-18). `/api/sdk/auth/user`
+     * (surfaced via [getSession] → [OneloUser.allowedIn]) now ships the conclusion
+     * so it cannot recur.
+     *
+     * The fallback is COMPATIBILITY, not a second source of truth: an older
+     * backend simply does not send `allowed_in`, and treating absent as `false`
+     * would lock every user out of an app running this SDK ahead of the backend.
+     * Delete it once the field is everywhere.
+     *
+     * Contract: docs/sdk-access-gate-wiring.md
+     */
+    suspend fun isAllowedIn(): Boolean {
+        val session = getSession() ?: return false
+        return allowedInDecision(session.user.allowedIn, paywallEnabled, session.user.entitlement)
     }
 
     /**
@@ -554,6 +790,7 @@ class OneloAuth internal constructor(
                     val url = URL("${config.apiUrl}/api/sdk/presence/heartbeat")
                     val conn = url.openConnection() as HttpURLConnection
                     conn.requestMethod = "POST"
+                    conn.instanceFollowRedirects = false  // see HttpClient.get() — the bearer would follow
                     conn.setRequestProperty("Authorization", "Bearer $accessToken")
                     conn.connect()
                     conn.responseCode // trigger the request
@@ -613,6 +850,10 @@ class OneloAuth internal constructor(
         put("role", user.role)
         put("tenantId", user.tenantId ?: "")
         put("entitlement", if (user.entitlement == OneloEntitlement.ACTIVE) "active" else "none")
+        // Omitted (not `put(..., false)`) when null, so readStoredSession's
+        // `has("allowedIn")` check correctly tells "never answered" apart from
+        // "answered false" across a save/restore round-trip.
+        if (user.allowedIn != null) put("allowedIn", user.allowedIn)
     }.toString()
 
     private fun notifyListeners(session: OneloSession?) {
@@ -643,6 +884,7 @@ class OneloAuth internal constructor(
                 role = (appMeta["user_role"] ?: user["role"] ?: "member") as? String ?: "member",
                 tenantId = (appMeta["tenant_id"] ?: user["tenant_id"]) as? String,
                 entitlement = OneloEntitlement.parse(user["entitlement"]),
+                allowedIn = user["allowed_in"] as? Boolean,
             )
         )
     }
@@ -653,7 +895,32 @@ class OneloAuth internal constructor(
             "email" to email,
         )
         if (redirectTo != null) body["redirectTo"] = redirectTo
-        HttpClient.post("${config.apiUrl}/api/sdk/auth/magic-link", body, baseHeaders())
+        // NOTE — no `code_challenge` here, deliberately (2026-08-18). Binding a
+        // PKCE challenge to a magic link is the right design and the backend
+        // supports it, but it cannot ship until the verifier is PERSISTED in a
+        // magic-link-specific slot (EncryptedSharedPreferences) the way Swift's
+        // `_beginFlowPKCE` does. `pkceVerifier` here is in-memory, is nulled after
+        // every password sign-in and regenerated on init — and Android routinely
+        // kills a process backgrounded behind the browser, which is exactly where
+        // a magic link is opened. A challenge bound to a verifier that no longer
+        // exists makes /hosted-callback 401, and the token is already marked used
+        // at consume, so the user is locked out with no recovery. A challenge-less
+        // link is weaker; a burnt link is broken.
+        // The status was previously discarded, so a throttled (429) or rejected
+        // request looked identical to a sent email and the caller told the user
+        // "check your inbox" for a mail that was never sent.
+        val resp = HttpClient.post("${config.apiUrl}/api/sdk/auth/magic-link", body, baseHeaders())
+        if (resp.status != 200) {
+            // Surface the backend's machine-readable code (e.g. placeholder_callback_scheme,
+            // forbidden_callback_scheme, invalid_callback_scheme, magic_link_disabled,
+            // magic_link_rate_limited) instead of a bare HTTP status — previously the
+            // response body was discarded here, so a caller could never distinguish a
+            // setup error from a rate limit and had nothing to show the developer/user.
+            val code = extractErrorCode(resp.body)
+            val message = extractErrorMessage(resp.body)
+                ?: "Magic link request failed: HTTP ${resp.status}"
+            throw OneloError.server(if (code != null) "[$code] $message" else message)
+        }
     }
 
     suspend fun sendPasswordReset(email: String, redirectTo: String? = null) {
@@ -667,8 +934,11 @@ class OneloAuth internal constructor(
 
     private fun enc(s: String) = URLEncoder.encode(s, "UTF-8")
 
-    private fun baseHeaders(): Map<String, String> = buildMap {
+    /** [bearer] is set only by [resolveFlow], where the backend must know WHO is
+     *  asking in order to answer anything other than "sign_in". */
+    private fun baseHeaders(bearer: String? = null): Map<String, String> = buildMap {
         put("X-SDK-Version", SDK_VERSION)
+        bearer?.let { put("Authorization", "Bearer $it") }
         integrityToken?.let { put("X-Integrity-Token", it) }
         // X-Bundle-Id + X-Onelo-Instance-Id (and Onelo's integrity token when set) so a
         // live app with a registered bundle isn't 403'd on /auth/initiate + /oauth/*/init.

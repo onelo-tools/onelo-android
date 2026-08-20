@@ -166,7 +166,20 @@ class Onelo(private val config: OneloConfig, context: Context) {
                 mapOf("Authorization" to "Bearer $token", "X-SDK-Version" to SDK_VERSION) + securityHeaders(),
             )
             if (resp.status != 200) {
-                Log.w("Onelo", "openUpgrade: upgrade-initiate HTTP ${resp.status}")
+                val code = extractErrorCode(resp.body)
+                if (code == "in_app_store_not_allowed") {
+                    Log.w(
+                        "Onelo",
+                        "openUpgrade: in_app_store_not_allowed — " +
+                            (extractErrorMessage(resp.body)
+                                ?: "the in-app store is hidden for this app (Paywall → Store → Access Gate)"),
+                    )
+                } else {
+                    Log.w(
+                        "Onelo",
+                        "openUpgrade: upgrade-initiate HTTP ${resp.status}" + (code?.let { " ($it)" } ?: ""),
+                    )
+                }
                 return
             }
             resp.body["upgrade_url"] as? String
@@ -216,6 +229,33 @@ class Onelo(private val config: OneloConfig, context: Context) {
             OneloCustomerPortalActivity.pendingExternalReturn?.let { it(code); return true }
         }
 
+        // 1b. An Access Gate refusal (magic link, or a sign-in that resolved to "no
+        //     plan") — there is deliberately no code, since the backend withholds it
+        //     rather than let the app decide. WHICH screen the person is owed was
+        //     decided server-side; this SDK only carries the URL, and only after
+        //     confirming it's one of THIS app's own hosted surfaces (any app on the
+        //     device can fire our scheme, and this value is about to be loaded in a
+        //     WebView). Before this, a magic-link refusal was silently dropped here
+        //     and the "Check your inbox" screen never moved (2026-08-20 — same
+        //     failure already fixed on Electron/Swift/RN/Flutter).
+        val gate = uri.getQueryParameter("gate")
+        if (!gate.isNullOrEmpty()) {
+            if (auth.isOneloHostedSurface(gate)) {
+                OneloAuthActivity.pendingGateReturn?.let { it(gate); return true }
+                // No "Check your inbox" screen is alive to receive it — Android
+                // routinely kills OneloAuthActivity while it's backgrounded behind
+                // the mail app / browser during a magic-link round trip, which nulls
+                // pendingGateReturn in onDestroy. Without this the refusal only ever
+                // reached Logcat and the app was left sitting on plain "Sign In" with
+                // zero feedback (2026-08-20). Relaunch the activity directly with the
+                // gate URL, same as any fresh loadAuthView() launch.
+                launchGateActivity(gate)
+            } else {
+                Log.w("Onelo", "refused a gate URL from an unknown origin")
+            }
+            return true
+        }
+
         // 2. A pending native OAuth sign-in (signInWithOAuth suspends until its callback).
         if (auth.hasPendingOAuth()) return auth.handleOAuthRedirect(uri)
 
@@ -234,6 +274,22 @@ class Onelo(private val config: OneloConfig, context: Context) {
 
         // 4. No code (cancel / error) with no pending flow — let auth handle/ignore it.
         return auth.handleOAuthRedirect(uri)
+    }
+
+    /** Present [gate] (a validated Onelo hosted-surface URL) in a fresh [OneloAuthActivity]
+     *  when no such Activity is currently alive to receive it via [OneloAuthActivity.pendingGateReturn].
+     *  Best-effort — a device with no launchable activity for it degrades to a warning. */
+    private fun launchGateActivity(gate: String) {
+        try {
+            appContext.startActivity(
+                Intent(appContext, OneloAuthActivity::class.java)
+                    .putExtra(OneloAuthActivity.EXTRA_URL, gate)
+                    .putExtra(OneloAuthActivity.EXTRA_SCHEME, config.callbackScheme)
+                    .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            )
+        } catch (e: Exception) {
+            Log.w("Onelo", "failed to present gate refusal: ${e.message}")
+        }
     }
 
     private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")

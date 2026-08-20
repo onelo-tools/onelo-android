@@ -19,6 +19,13 @@ internal object HttpClient {
         withContext(Dispatchers.IO) {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "GET"
+                // Do NOT follow redirects. HttpURLConnection defaults to
+                // true and REPLAYS every header — including Authorization —
+                // at the new host. A 3xx to a foreign origin (hijacked or
+                // expired domain, misconfigured CDN, a dev pointing apiUrl at
+                // a tunnel) would hand the user's access token to that host.
+                // Every Onelo endpoint is direct, so nothing is lost.
+                instanceFollowRedirects = false
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }
                 connectTimeout = 15_000
                 readTimeout = 15_000
@@ -30,6 +37,7 @@ internal object HttpClient {
         withContext(Dispatchers.IO) {
             val conn = (URL(url).openConnection() as HttpURLConnection).apply {
                 requestMethod = "POST"
+                instanceFollowRedirects = false  // see get() — headers are replayed to the new host
                 doOutput = true
                 setRequestProperty("Content-Type", "application/json")
                 headers.forEach { (k, v) -> setRequestProperty(k, v) }

@@ -611,6 +611,7 @@ class OneloMonitor internal constructor(
             try {
                 conn = (URL("${config.apiUrl}/api/sdk/monitor/events/batch").openConnection() as HttpURLConnection).apply {
                     requestMethod = "POST"
+                    instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
                     doOutput = true
                     setRequestProperty("Content-Type", "application/json")
                     setRequestProperty("X-Sdk-Version", SDK_VERSION)

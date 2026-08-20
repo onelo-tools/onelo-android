@@ -149,6 +149,7 @@ internal class OneloEventStream(
             conn = withContext(Dispatchers.IO) {
                 (URL("$apiUrl/api/sdk/features/stream?$q").openConnection() as HttpURLConnection).apply {
                     requestMethod = "GET"
+                    instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
                     setRequestProperty("Accept", "text/event-stream")
                     setRequestProperty("X-Sdk-Version", sdkVersion)
                     // X-Bundle-Id (+ X-Integrity-Token / instance id) — without it the

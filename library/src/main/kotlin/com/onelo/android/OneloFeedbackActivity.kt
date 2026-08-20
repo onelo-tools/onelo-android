@@ -185,6 +185,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
                 // can't set headers, so use an explicit HttpURLConnection.
                 val conn = (URL(initiateUrl).openConnection() as java.net.HttpURLConnection).apply {
                     requestMethod = "GET"
+                    instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
                     connectTimeout = 10_000
                     readTimeout = 10_000
                     feedbackUserId?.let { setRequestProperty("X-Onelo-User-Id", it) }

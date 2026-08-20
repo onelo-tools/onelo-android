@@ -15,6 +15,8 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import androidx.appcompat.app.AppCompatActivity
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.launch
 
 /**
  * True when [url] is an OAuth navigation that MUST leave the embedded WebView.
@@ -31,6 +33,21 @@ import androidx.appcompat.app.AppCompatActivity
  * policy is unit-testable on the JVM without Robolectric. Mirrors Electron's
  * `isOAuthProviderUrl` and RN's `isOAuthNavigation`.
  */
+/**
+ * The lowercased host of [url] if it's `https://` and non-empty, else null.
+ *
+ * Deliberately plain-Kotlin (java.net.URI, not android.net.Uri) so origin matching
+ * is unit-testable on the JVM, same reasoning as [isOneloOAuthUrl]. Used to check a
+ * `gate` deep-link value against a remembered hosted origin before it's loaded in a
+ * WebView — an unchecked value here is a phishing page wearing the app's own
+ * sign-in window, since ANY app on the device can fire our callback scheme.
+ */
+internal fun oneloHostedOriginHost(url: String): String? {
+    val parsed = try { java.net.URI(url) } catch (_: Exception) { return null }
+    if (parsed.scheme?.lowercase() != "https") return null
+    return parsed.host?.lowercase()?.takeIf { it.isNotEmpty() }
+}
+
 internal fun isOneloOAuthUrl(url: String): Boolean {
     val parsed = try { java.net.URI(url) } catch (_: Exception) { return false }
     val scheme = parsed.scheme?.lowercase() ?: return false
@@ -74,6 +91,52 @@ class OneloAuthActivity : AppCompatActivity() {
         @Volatile
         @JvmStatic
         var pendingExternalReturn: ((String) -> Unit)? = null
+
+        /**
+         * Set while an [OneloAuthActivity] is on-screen showing "Check your inbox".
+         * A magic link opens in the user's mail app, which hands the click to the
+         * SYSTEM BROWSER, not this WebView — the Access Gate refusal (`?gate=…`,
+         * no code) that browser tab produces then arrives back here purely via the
+         * OS deep link ([Onelo.handleRedirect]), same as [pendingExternalReturn]
+         * does for a returning `code`. Without this hook the refusal had nowhere to
+         * land: [Onelo.handleRedirect] found no code, no pending OAuth, and the
+         * refusal was silently dropped while this Activity sat on "Check your inbox"
+         * forever. Parity with Swift's `pendingGateUrl` / Electron's gate handling.
+         */
+        @Volatile
+        @JvmStatic
+        var pendingGateReturn: ((String) -> Unit)? = null
+
+        /**
+         * Supplies a FRESH hosted URL when the page hands control back saying its
+         * addressing token is spent (`?error=invalid_token`). Set by
+         * [OneloAuth.loadAuthView] before launching; returns null if the flow can
+         * no longer be resolved.
+         *
+         * Same static-hook idiom as [pendingExternalReturn] — the Activity is
+         * started by the framework and has no reference to the SDK instance.
+         *
+         * Why it exists: without it a code-less callback took the plain cancel
+         * path, so "Use a different account" on the no-plan page (which signs the
+         * user out and returns `?error=invalid_token`) simply CLOSED the auth
+         * window on them. Parity with Swift's `onSessionExpired`.
+         */
+        @Volatile
+        @JvmStatic
+        var pendingFreshUrl: (suspend () -> String?)? = null
+
+        /**
+         * Is this `?error=` value the hosted page saying its addressing token is
+         * spent? Internal (not private) so the rule is tested directly rather
+         * than re-implemented in a test — a test that re-implements the rule
+         * stays green after the behaviour is deleted.
+         *
+         * NOT a catch-all: a genuine failure must still take the cancel path.
+         * Reloading on every error would loop forever on one.
+         */
+        @JvmStatic
+        internal fun isExpiredAuthError(err: String?): Boolean =
+            err == "invalid_token" || err == "expired_token" || err == "token_expired"
     }
 
     private lateinit var webView: WebView
@@ -113,6 +176,11 @@ class OneloAuthActivity : AppCompatActivity() {
         // Any code that reaches the app while THIS store WebView is open (the card
         // completed in the external browser) should finish this Activity with it.
         pendingExternalReturn = { code -> runOnUiThread { deliverCode(code) } }
+        // A gate refusal that reaches the app while THIS "Check your inbox" screen
+        // is open — load it into the SAME WebView instead of leaving the screen
+        // stuck. The URL was already validated by Onelo.handleRedirect before this
+        // hook is invoked (isOneloHostedSurface), so no re-check is needed here.
+        pendingGateReturn = { url -> runOnUiThread { if (!isFinishing) webView.loadUrl(url) } }
         container.addView(webView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
@@ -141,7 +209,20 @@ class OneloAuthActivity : AppCompatActivity() {
                     uri.host.equals("callback", ignoreCase = true)
                 ) {
                     val code = uri.getQueryParameter("code")
-                    if (!code.isNullOrBlank()) deliverCode(code) else deliverCancelled()
+                    val error = uri.getQueryParameter("error")
+                    val expired = isExpiredAuthError(error)
+                    val gate = uri.getQueryParameter("gate")
+                    when {
+                        !code.isNullOrBlank() -> deliverCode(code)
+                        expired -> reloadFreshHostedUrl()
+                        // A refusal reached IN this WebView (no browser hand-off
+                        // involved) — load it in place, same surface. This value
+                        // came from a navigation inside a page we already loaded
+                        // from our own hosted origin, unlike the deep-link path in
+                        // Onelo.handleRedirect, which must validate it first.
+                        !gate.isNullOrBlank() -> webView.loadUrl(gate)
+                        else -> deliverCancelled()
+                    }
                     return true // consume — never let the WebView load the unknown scheme
                 }
                 // SOCIAL SIGN-IN → system browser. Google and Apple sniff the
@@ -266,7 +347,11 @@ class OneloAuthActivity : AppCompatActivity() {
     override fun onDestroy() {
         // Release the store external-return hook, but only if it's still ours (a
         // newer OneloAuthActivity may have replaced it).
-        if (!isChangingConfigurations) pendingExternalReturn = null
+        if (!isChangingConfigurations) {
+            pendingExternalReturn = null
+            pendingGateReturn = null
+            pendingFreshUrl = null
+        }
         super.onDestroy()
     }
 
@@ -280,6 +365,28 @@ class OneloAuthActivity : AppCompatActivity() {
             webView.goBack()
         } else {
             deliverCancelled()
+        }
+    }
+
+    /**
+     * The addressing token is spent — re-resolve the flow and load the URL it
+     * gives us (now a clean sign-in page, since the session was just revoked).
+     * Falls back to cancelling if the flow can't be resolved, which is the old
+     * behaviour and still better than a frozen WebView.
+     */
+    private fun reloadFreshHostedUrl() {
+        val supplier = pendingFreshUrl
+        if (supplier == null) { deliverCancelled(); return }
+        lifecycleScope.launch {
+            val fresh = try {
+                supplier()
+            } catch (e: Exception) {
+                // Never swallow silently — a dead reload is the difference between
+                // "landed on sign-in" and "window vanished".
+                android.util.Log.w("Onelo", "reload after expiry failed: ${e.message}")
+                null
+            }
+            if (fresh != null && !isFinishing) webView.loadUrl(fresh) else deliverCancelled()
         }
     }
 

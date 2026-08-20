@@ -111,6 +111,7 @@ internal class OneloPlayIntegrity(
             val url = URL("$apiUrl/api/sdk/auth/play-integrity")
             val conn = url.openConnection() as HttpURLConnection
             conn.requestMethod = "POST"
+            conn.instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
             conn.setRequestProperty("Content-Type", "application/json")
             conn.doOutput = true
             conn.connectTimeout = 10_000
