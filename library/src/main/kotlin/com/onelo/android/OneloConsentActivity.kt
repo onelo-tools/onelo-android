@@ -13,6 +13,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.ProgressBar
 import androidx.appcompat.app.AppCompatActivity
+import com.onelo.android.internal.applyStatusBarInsetPadding
 
 /**
  * Hosts the Onelo-hosted legal-consent gate page inside a full-screen WebView.
@@ -88,6 +89,7 @@ class OneloConsentActivity : AppCompatActivity() {
             )
         )
         setContentView(container)
+        applyStatusBarInsetPadding(container)
 
         webView.addJavascriptInterface(OneloBridge(), "OneloAndroid")
         webView.webViewClient = object : WebViewClient() {

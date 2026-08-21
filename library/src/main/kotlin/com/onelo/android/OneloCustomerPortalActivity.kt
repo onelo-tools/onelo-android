@@ -20,6 +20,7 @@ import android.widget.FrameLayout
 import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.onelo.android.internal.applyStatusBarInsetPadding
 
 /**
  * Hosts the Onelo-hosted Customer Portal page inside a WebView.
@@ -219,6 +220,7 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             }
         )
         setContentView(container)
+        applyStatusBarInsetPadding(container)
 
         // #44 — arm the fail-safe ✕ only after the grace period. A fast load posts
         // `onelo:ready` first (→ cancels this), so the ✕ never flashes on screen.

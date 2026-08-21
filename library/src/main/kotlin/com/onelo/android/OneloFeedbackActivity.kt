@@ -15,6 +15,7 @@ import android.webkit.WebViewClient
 import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import com.onelo.android.internal.applyStatusBarInsetPadding
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -153,6 +154,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
             }
         )
         setContentView(container)
+        applyStatusBarInsetPadding(container)
 
         // #44 — arm the fail-safe ✕ only after the grace period. A fast load posts
         // `onelo:ready` first (→ cancels this), so the ✕ never flashes on screen.

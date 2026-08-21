@@ -16,6 +16,7 @@ import android.widget.FrameLayout
 import android.widget.ProgressBar
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
+import com.onelo.android.internal.applyStatusBarInsetPadding
 import kotlinx.coroutines.launch
 
 /**
@@ -190,6 +191,7 @@ class OneloAuthActivity : AppCompatActivity() {
             FrameLayout.LayoutParams.WRAP_CONTENT
         ))
         setContentView(container)
+        applyStatusBarInsetPadding(container)
 
         webView.addJavascriptInterface(OneloBridge(), "OneloAndroid")
         webView.webViewClient = object : WebViewClient() {
