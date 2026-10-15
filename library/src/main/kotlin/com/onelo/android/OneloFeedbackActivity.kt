@@ -3,6 +3,9 @@ package com.onelo.android
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.os.Bundle
+import com.onelo.android.internal.paintGround
+import com.onelo.android.internal.tint
+import com.onelo.android.internal.tintCloseGlyph
 import android.os.Handler
 import android.os.Looper
 import android.view.Gravity
@@ -18,10 +21,10 @@ import androidx.appcompat.app.AppCompatActivity
 import com.onelo.android.internal.applyStatusBarInsetPadding
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
-import org.json.JSONObject
-import java.net.URL
 
 class OneloFeedbackActivity : AppCompatActivity() {
 
@@ -32,34 +35,26 @@ class OneloFeedbackActivity : AppCompatActivity() {
         // instance id) captured by OneloFeedback + applied to the /initiate request here.
         const val EXTRA_SECURITY_HEADERS = "onelo_feedback_security_headers"
 
-        private const val SKELETON_HTML = """<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px;overflow:hidden}
-@keyframes shimmer{0%{background-position:-600px 0}100%{background-position:600px 0}}
-.sk{border-radius:10px;background:linear-gradient(90deg,#1e1e1e 25%,#2a2a2a 50%,#1e1e1e 75%);background-size:600px 100%;animation:shimmer 1.4s infinite linear}
-.icon{width:64px;height:64px;border-radius:14px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px;border-radius:6px}
-.cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:12px}
-.label{width:60px;height:13px;border-radius:4px;margin-bottom:8px}
-.input{width:100%;height:44px;border-radius:10px;margin-bottom:24px}
-.textarea{width:100%;height:110px;border-radius:10px;margin-bottom:32px}
-.btn{width:100%;height:48px;border-radius:12px}
-</style></head><body>
-<div class="sk icon"></div><div class="sk title"></div>
-<div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div><div class="sk input"></div>
-<div class="sk label"></div><div class="sk textarea"></div>
-<div class="sk btn"></div>
-</body></html>"""
 
-        private const val RELAY_JS = """
+        internal const val RELAY_JS = """
 (function() {
+    // Once per document: onPageFinished can fire more than once for one page.
+    if (window.__oneloFeedbackRelay) return;
+    window.__oneloFeedbackRelay = true;
+    // #622 — the form's reporter token `ft` expired; it asks (a self-post, or a
+    // request parked before this relay ran) for a fresh one.
+    function oneloFeedbackRenew(d) {
+        if (d && d.type === 'onelo:renew_request' && d.kind === 'feedback' && typeof d.request_id === 'string') {
+            OneloFeedback.renew(d.request_id);
+            return true;
+        }
+        return false;
+    }
+    if (window.__oneloRenewPending) oneloFeedbackRenew(window.__oneloRenewPending);
     window.addEventListener('message', function(e) {
         try {
             var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+            if (e.source === window && oneloFeedbackRenew(data)) return;
             if (data && data.type === 'onelo:feedback_submitted') {
                 OneloFeedback.onSubmitted();
             } else if (data && data.type === 'onelo:feedback_close') {
@@ -91,14 +86,23 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         if (::closeButton.isInitialized) closeButton.visibility = View.VISIBLE
     }
 
+    // #622 — what renewing the form's `ft` needs: the same initiate request.
+    private var initiateUrl: String? = null
+    private var feedbackUserId: String? = null
+    private var securityHeaders: HashMap<*, *>? = null
+    /** The hosted form's origin — only a page on it may ask for a renewal. */
+    private var hostedOrigin: String? = null
+    private val renewScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
+
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
         val initiateUrl = intent.getStringExtra(EXTRA_INITIATE_URL)
-        val feedbackUserId = intent.getStringExtra(EXTRA_USER_ID)
+        feedbackUserId = intent.getStringExtra(EXTRA_USER_ID)
         @Suppress("DEPRECATION")
-        val securityHeaders = intent.getSerializableExtra(EXTRA_SECURITY_HEADERS) as? HashMap<*, *>
+        securityHeaders = intent.getSerializableExtra(EXTRA_SECURITY_HEADERS) as? HashMap<*, *>
+        this.initiateUrl = initiateUrl
         if (initiateUrl.isNullOrBlank()) {
             setResult(Activity.RESULT_CANCELED)
             finish()
@@ -109,8 +113,10 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
-            setBackgroundColor(android.graphics.Color.parseColor("#111111"))
         }
+        // #681 — ground and fail-safe ✕ from the brand tokens.
+        val brand = OneloBrandChrome.from(OneloBrand.current)
+        brand.paintGround(container, webView)
         container.addView(webView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
@@ -131,7 +137,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         val edgeMargin = (4 * density).toInt()
         closeButton = TextView(this).apply {
             text = "✕"
-            setTextColor(android.graphics.Color.WHITE)
+            brand.tintCloseGlyph(this)
             textSize = 22f // sp
             setPadding(touchPadding, touchPadding, touchPadding, touchPadding)
             isClickable = true
@@ -177,33 +183,14 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         }
 
         // 1. Show skeleton immediately
-        webView.loadDataWithBaseURL(null, SKELETON_HTML, "text/html", "UTF-8", null)
+        webView.loadDataWithBaseURL(null, oneloFeedbackSkeletonHtml(OneloBrand.current), "text/html", "UTF-8", null)
 
         // 2. Fetch hosted URL in background, navigate when ready
         CoroutineScope(Dispatchers.IO).launch {
             try {
-                // userId travels as a HEADER (X-Onelo-User-Id), not a query param,
-                // so it never appears in the access-logged initiate URL. readText()
-                // can't set headers, so use an explicit HttpURLConnection.
-                val conn = (URL(initiateUrl).openConnection() as java.net.HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
-                    connectTimeout = 10_000
-                    readTimeout = 10_000
-                    feedbackUserId?.let { setRequestProperty("X-Onelo-User-Id", it) }
-                    // X-Bundle-Id (+ X-Integrity-Token / instance id) — without it the
-                    // backend security gate 403s a live app with a registered bundle.
-                    securityHeaders?.forEach { (k, v) ->
-                        if (k is String && v is String) setRequestProperty(k, v)
-                    }
-                }
-                val json = try {
-                    conn.inputStream.bufferedReader().use { it.readText() }
-                } finally {
-                    conn.disconnect()
-                }
-                val hostedUrl = JSONObject(json).getString("hosted_url")
+                val hostedUrl = fetchHostedUrl(initiateUrl)
                 withContext(Dispatchers.Main) {
+                    hostedOrigin = PortalRenewal.originOf(hostedUrl)
                     if (!isFinishing) webView.loadUrl(hostedUrl)
                 }
             } catch (_: Exception) {
@@ -215,6 +202,18 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
         }
     }
 
+    /** GET /feedback/initiate → hosted_url, carrying the signed-in user's token (#820). */
+    private suspend fun fetchHostedUrl(initiateUrl: String): String =
+        FeedbackInitiate.hostedUrl(
+            initiateUrl = initiateUrl,
+            userId = feedbackUserId,
+            securityHeaders = securityHeaders
+                ?.mapNotNull { (k, v) -> if (k is String && v is String) k to v else null }
+                ?.toMap()
+                .orEmpty(),
+            userToken = FeedbackInitiate.userToken,
+        )
+
     @Suppress("OVERRIDE_DEPRECATION")
     override fun onBackPressed() {
         if (webView.canGoBack()) webView.goBack()
@@ -223,6 +222,7 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
 
     override fun onDestroy() {
         failsafeHandler.removeCallbacks(showFailsafeRunnable)
+        renewScope.cancel()
         super.onDestroy()
     }
 
@@ -246,6 +246,28 @@ body{background:#111;font-family:-apple-system,sans-serif;padding:40px 36px 32px
          * Hosted page mounted (`onelo:ready`) → hide the native fail-safe ✕ and cancel
          * the pending grace-timer show, so only the hosted page's canonical ✕ remains.
          */
+        /**
+         * #622 — the form's reporter token `ft` (30 minutes) expired before submit.
+         * Initiate the same request again and hand the fresh hosted URL back as a
+         * self-post the page trusts; the page submits with its new `ft`.
+         */
+        @JavascriptInterface
+        fun renew(requestId: String) {
+            val url = initiateUrl ?: return
+            renewScope.launch {
+                // Answer only a page still on the hosted form's origin.
+                if (!::webView.isInitialized || PortalRenewal.originOf(webView.url) != hostedOrigin) return@launch
+                val reply = try {
+                    PortalRenewal.renewed(requestId, withContext(Dispatchers.IO) { fetchHostedUrl(url) })
+                } catch (_: Exception) {
+                    PortalRenewal.failed(requestId, "renew_failed")
+                }
+                if (::webView.isInitialized && !isDestroyed) {
+                    webView.evaluateJavascript(PortalRenewal.replyScript(reply), null)
+                }
+            }
+        }
+
         @JavascriptInterface
         fun onReady() {
             runOnUiThread {

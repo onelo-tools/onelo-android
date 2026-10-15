@@ -32,4 +32,31 @@ class OneloAuthExpiredCallbackTest {
         assertFalse(OneloAuthActivity.isExpiredAuthError(null))
         assertFalse(OneloAuthActivity.isExpiredAuthError(""))
     }
+
+    @Test
+    fun `authorized re-resolve is a successful terminal action`() {
+        assertTrue(
+            OneloAuthActivity.freshFlowAction(OneloAuth.FlowDecision.Authorized)
+                is FreshFlowAction.Authorized
+        )
+    }
+
+    @Test
+    fun `present re-resolve preserves the fresh hosted URL`() {
+        val action = OneloAuthActivity.freshFlowAction(
+            OneloAuth.FlowDecision.Present("sign_in", "https://example.com/auth?token=fresh")
+        )
+        assertEquals(
+            "https://example.com/auth?token=fresh",
+            (action as FreshFlowAction.Present).url
+        )
+    }
+
+    @Test
+    fun `failed re-resolve stays open as a retryable error`() {
+        assertTrue(
+            OneloAuthActivity.freshFlowAction(null)
+                is FreshFlowAction.RetryableError
+        )
+    }
 }

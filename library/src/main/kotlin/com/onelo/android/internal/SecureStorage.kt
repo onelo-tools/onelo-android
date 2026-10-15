@@ -5,7 +5,7 @@ import androidx.security.crypto.EncryptedSharedPreferences
 import androidx.security.crypto.MasterKeys
 import java.util.UUID
 
-internal class SecureStorage(context: Context) {
+internal class SecureStorage(context: Context) : KeyValueStore {
 
     private val masterKeyAlias = MasterKeys.getOrCreate(MasterKeys.AES256_GCM_SPEC)
 
@@ -17,13 +17,13 @@ internal class SecureStorage(context: Context) {
         EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM,
     )
 
-    fun get(key: String): String? = prefs.getString(key, null)
+    override fun get(key: String): String? = prefs.getString(key, null)
 
-    fun set(key: String, value: String) {
+    override fun set(key: String, value: String) {
         prefs.edit().putString(key, value).apply()
     }
 
-    fun remove(key: String) {
+    override fun remove(key: String) {
         prefs.edit().remove(key).apply()
     }
 
@@ -50,6 +50,9 @@ internal class SecureStorage(context: Context) {
             "onelo_refresh_token",
             "onelo_expires_at",
             "onelo_user",
+            // Sign-out drops the hosted-flow verifier too (#541).
+            FlowPkce.VERIFIER_KEY,
+            FlowPkce.ISSUED_AT_KEY,
         )
     }
 }

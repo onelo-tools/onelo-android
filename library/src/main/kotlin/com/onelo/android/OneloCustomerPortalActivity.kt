@@ -5,6 +5,9 @@ import android.app.Activity
 import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
+import com.onelo.android.internal.paintGround
+import com.onelo.android.internal.tint
+import com.onelo.android.internal.tintCloseGlyph
 import android.os.Handler
 import android.os.Looper
 import android.os.Message
@@ -21,6 +24,12 @@ import android.widget.ProgressBar
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import com.onelo.android.internal.applyStatusBarInsetPadding
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 /**
  * Hosts the Onelo-hosted Customer Portal page inside a WebView.
@@ -66,6 +75,9 @@ class OneloCustomerPortalActivity : AppCompatActivity() {
          * that completed. [OneloCustomerPortal] exchanges it for a refreshed session.
          */
         const val EXTRA_CODE = "onelo_portal_code"
+        /** Result extra (RESULT_OK): the store opened in the portal finished a plan
+         *  switch with no checkout; the value is the store's reason (#659). */
+        const val EXTRA_STORE_DONE = "onelo_portal_store_done"
 
         /**
          * Set while an [OneloCustomerPortalActivity] is on-screen. When a "Change plan"
@@ -81,34 +93,25 @@ class OneloCustomerPortalActivity : AppCompatActivity() {
         var pendingExternalReturn: ((String) -> Unit)? = null
 
         /**
-         * Pre-connect loading skeleton shown in the WebView while the hosted portal
-         * page loads. Canonical HTML shared across all SDKs — mirrors
-         * frontend/app/customer/portal/PortalSkeleton.tsx. Kills the white flash.
+         * #613 / #614 — answers the hosted page's `onelo:renew_request` with a fresh
+         * portal, minted with the signed-in user's session. Set by
+         * [OneloCustomerPortal.openCustomerPortal] before it launches this Activity
+         * (an Intent cannot carry a closure). Null → the page is told nothing and
+         * shows its expiry screen after its own timeout.
          */
-        private const val SKELETON_HTML = """<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<style>
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
-@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}
-.wrap{display:flex;flex-direction:column;align-items:center;width:100%;padding:48px 24px 0}
-.col{width:100%;max-width:432px;display:flex;flex-direction:column;gap:14px}
-.sk{background-color:rgba(255,255,255,0.04);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.12) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:8px}
-.strong{background-color:rgba(255,255,255,0.08);background-image:linear-gradient(90deg,rgba(255,255,255,0) 0%,rgba(255,255,255,0.18) 50%,rgba(255,255,255,0) 100%);background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;animation:onelo-shimmer 2.4s linear infinite;border-radius:9px}
-.icon{width:64px;height:64px;border-radius:14px;margin-bottom:14px;background:rgba(255,255,255,0.06);border:1.5px solid rgba(255,255,255,0.1)}
-.title{width:200px;height:22px;margin-bottom:10px;border-radius:6px}
-.sub{width:80px;height:13px;opacity:0.7;margin-bottom:32px;border-radius:4px}
-.c1{height:240px;border-radius:14px}
-.c2{height:80px;border-radius:14px}
-.c3{height:140px;border-radius:14px}
-</style></head><body>
-<div class="wrap">
-<div class="sk icon"></div>
-<div class="sk title"></div>
-<div class="sk sub"></div>
-<div class="col"><div class="strong c1"></div><div class="strong c2"></div><div class="strong c3"></div></div>
-</div>
-</body></html>"""
+        @Volatile
+        @JvmStatic
+        internal var renewHandler: (suspend (String) -> JSONObject)? = null
+
+        /**
+         * #606 — receives this Activity's result when it was started WITHOUT a
+         * launcher (`Onelo.openUpgrade` starts it from the application context, so
+         * no `onActivityResult` exists). Called once, when the Activity finishes.
+         */
+        @Volatile
+        @JvmStatic
+        internal var resultHandler: ((resultCode: Int, data: Intent?) -> Unit)? = null
+
 
         // #44 — grace period before the native fail-safe ✕ appears. A normal (fast)
         // load posts `onelo:ready` well before this elapses, so the ✕ never flashes;
@@ -127,8 +130,11 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
         if (::closeButton.isInitialized) closeButton.visibility = View.VISIBLE
     }
     private var resultDelivered = false
+    private val renewScope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     // Default matches PORTAL_CALLBACK_SCHEME / OneloConfig.callbackScheme's default.
     private var callbackScheme: String = PORTAL_CALLBACK_SCHEME
+    /** The hosted portal's origin — only a page on it may ask for a renewal (#614). */
+    private var portalOrigin: String? = null
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -143,6 +149,7 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             finish()
             return
         }
+        portalOrigin = PortalRenewal.originOf(url)
 
         // Build layout programmatically — no XML resources needed in the library.
         val container = FrameLayout(this)
@@ -158,8 +165,11 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             // system browser instead of loading card entry in this embedded WebView.
             settings.setSupportMultipleWindows(true)
             settings.javaScriptCanOpenWindowsAutomatically = true
-            setBackgroundColor(android.graphics.Color.parseColor("#111111"))
         }
+        // #681 — ground, progress arc and fail-safe ✕ from the brand tokens.
+        val brand = OneloBrandChrome.from(OneloBrand.current)
+        brand.paintGround(container, webView)
+        brand.tint(progressBar)
 
         // Any code that reaches the app while THIS portal WebView is open (a "Change
         // plan" card completed in the external browser) should finish with it.
@@ -200,7 +210,7 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
         val edgeMargin = (4 * density).toInt()
         closeButton = TextView(this).apply {
             text = "✕"
-            setTextColor(android.graphics.Color.WHITE)
+            brand.tintCloseGlyph(this)
             textSize = 22f // sp
             setPadding(touchPadding, touchPadding, touchPadding, touchPadding)
             isClickable = true
@@ -230,6 +240,9 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             callbackScheme = callbackScheme,
             onDone = { event -> deliverDone(event) },
             onCode = { code -> deliverCode(code) },
+            onStoreDone = { reason -> deliverStoreDone(reason) },
+            // #606 — "Return to app" on a spent store link: close, nothing finished.
+            onStoreCancel = { deliverCancelled() },
             onExternalOpen = { uri -> openInBrowser(uri) },
             onPageFinished = { progressBar.visibility = View.GONE },
             // Hosted page failed to load → its canonical ✕ will never appear. Surface
@@ -270,7 +283,7 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
 
         // Show the loading skeleton immediately so there's no white flash while the
         // hosted portal page loads. It stays visible until the real page commits.
-        webView.loadDataWithBaseURL(null, SKELETON_HTML, "text/html", "UTF-8", null)
+        webView.loadDataWithBaseURL(null, oneloPortalSkeletonHtml(OneloBrand.current), "text/html", "UTF-8", null)
         webView.loadUrl(url)
     }
 
@@ -295,9 +308,20 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
 
     override fun onDestroy() {
         failsafeHandler.removeCallbacks(showFailsafeRunnable)
+        renewScope.cancel()
         // Release the external-return hook, but only if it's still ours (a newer
         // OneloCustomerPortalActivity may have replaced it).
-        if (!isChangingConfigurations) pendingExternalReturn = null
+        if (!isChangingConfigurations) {
+            pendingExternalReturn = null
+            // The renew answer holds the OneloAuth closure; drop it with the portal.
+            renewHandler = null
+            // #606 — a launcher-less start (openUpgrade) learns how it ended here.
+            if (isFinishing) {
+                val handler = resultHandler
+                resultHandler = null
+                handler?.invoke(finalResultCode, finalResultData)
+            }
+        }
         super.onDestroy()
     }
 
@@ -320,30 +344,57 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
         resultDelivered = true
         val data = Intent()
         if (event != null) data.putExtra(EXTRA_EVENT, event)
-        setResult(Activity.RESULT_OK, data)
+        finishWith(Activity.RESULT_OK, data)
+    }
+
+    /** The result for [resultHandler]; RESULT_CANCELED until something is delivered. */
+    private var finalResultCode = Activity.RESULT_CANCELED
+    private var finalResultData: Intent? = null
+
+    private fun finishWith(resultCode: Int, data: Intent?) {
+        finalResultCode = resultCode
+        finalResultData = data
+        setResult(resultCode, data)
         finish()
+    }
+
+    /** Deliver RESULT_OK for a code-less plan switch, with the store's reason (#659). */
+    private fun deliverStoreDone(reason: String) {
+        if (resultDelivered) return
+        resultDelivered = true
+        finishWith(Activity.RESULT_OK, Intent().putExtra(EXTRA_STORE_DONE, reason))
     }
 
     /** Deliver RESULT_OK with a "Change plan" card code and finish (SDK exchanges it). */
     private fun deliverCode(code: String) {
         if (resultDelivered) return
         resultDelivered = true
-        setResult(Activity.RESULT_OK, Intent().putExtra(EXTRA_CODE, code))
-        finish()
+        finishWith(Activity.RESULT_OK, Intent().putExtra(EXTRA_CODE, code))
     }
 
     private fun deliverCancelled() {
         if (resultDelivered) return
         resultDelivered = true
-        setResult(Activity.RESULT_CANCELED)
-        finish()
+        finishWith(Activity.RESULT_CANCELED, null)
     }
 
-    /** JS bridge — relays a store `onelo:code` postMessage (parity w/ OneloAuthActivity). */
+    /** JS bridge — the store's hand-back, `onelo:ready` and renew requests. */
     private inner class OneloBridge {
+        /**
+         * The store's postMessage hand-back (#627), decoded by the one decoder: a
+         * purchase finishes with its code, a code-less plan switch is Done, and
+         * "Return to app" on a spent link closes the portal.
+         */
         @JavascriptInterface
-        fun onCode(code: String) {
-            runOnUiThread { deliverCode(code) }
+        fun onHandBack(type: String, code: String, reason: String) {
+            val handBack = classifyHandBackMessage(type, code, reason) ?: return
+            runOnUiThread {
+                when (handBack) {
+                    is HandBack.Purchase -> deliverCode(handBack.code)
+                    is HandBack.Switched -> deliverStoreDone(handBack.reason)
+                    is HandBack.Error, is HandBack.PortalClosed -> deliverCancelled()
+                }
+            }
         }
 
         /**
@@ -356,10 +407,23 @@ body{background:#111111;font-family:-apple-system,sans-serif;overflow:hidden}
             runOnUiThread { hideFailsafe() }
         }
 
+        /**
+         * #613 / #614 — the page's portal token died; mint a fresh portal with the
+         * user's session and hand it back as a self-post the page trusts.
+         */
         @JavascriptInterface
-        fun onCancelled() {
-            // A store cancel inside the portal shouldn't tear the portal down — the
-            // buyer may just be backing out of checkout. No-op (Back / ✕ still close).
+        fun renewPortal(requestId: String) {
+            val handler = renewHandler ?: return
+            renewScope.launch {
+                // A fresh portal is a bearer credential: hand it only to a page
+                // still on the portal's own origin, never to a page the WebView
+                // was navigated to (a PSP redirect, an external link).
+                if (!::webView.isInitialized || PortalRenewal.originOf(webView.url) != portalOrigin) return@launch
+                val reply = try { handler(requestId) } catch (_: Exception) { PortalRenewal.failed(requestId, "renew_failed") }
+                if (::webView.isInitialized && !isDestroyed) {
+                    webView.evaluateJavascript(PortalRenewal.replyScript(reply), null)
+                }
+            }
         }
     }
 }
@@ -372,6 +436,8 @@ private class OneloCustomerPortalWebViewClient(
     private val callbackScheme: String,
     private val onDone: (event: String?) -> Unit,
     private val onCode: (code: String) -> Unit,
+    private val onStoreDone: (reason: String) -> Unit,
+    private val onStoreCancel: () -> Unit,
     private val onExternalOpen: (uri: Uri) -> Unit,
     private val onPageFinished: () -> Unit,
     private val onError: () -> Unit,
@@ -387,12 +453,16 @@ private class OneloCustomerPortalWebViewClient(
             (function() {
                 if (window.__oneloPortalRelay) return;
                 window.__oneloPortalRelay = true;
+                ${PortalRenewal.RELAY_SNIPPET}
+                ${HAND_BACK_RELAY_SNIPPET}
                 window.addEventListener('message', function(e) {
                     try {
                         var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
-                        if (data && data.type === 'onelo:code' && data.code) {
-                            OneloAndroid.onCode(data.code);
-                        } else if (data && data.type === 'onelo:ready') {
+                        // #614 — only the page's own self-post may ask for a renewal.
+                        if (e.source === window && oneloRenew(data)) return;
+                        // #627 — the store's hand-back, decoded natively.
+                        if (oneloHandBack(data)) return;
+                        if (data && data.type === 'onelo:ready') {
                             OneloAndroid.onReady();
                         }
                     } catch(err) {}
@@ -408,6 +478,8 @@ private class OneloCustomerPortalWebViewClient(
      *  1. `<scheme>://callback?source=portal[&event=…]` → portal Done (existing).
      *  2. `<scheme>://callback?code=…` → a "Change plan" card that completed in-WebView
      *     (the store's native status-poll deep-link) → finish with the code.
+     *     `<scheme>://callback?source=store&event=…` → a plan switch with no checkout
+     *     finished (#599) → Done.
      *  3. The Stripe CARD page (`/store/pay`, `/paywall`, `*.stripe.com`) reached by a
      *     top-level nav → SYSTEM BROWSER. Plan selection (`/store/hosted`) stays in-app.
      * All other URLs load normally.
@@ -430,14 +502,18 @@ private class OneloCustomerPortalWebViewClient(
         if (uri.scheme?.equals(callbackScheme, ignoreCase = true) == true
             && uri.host?.equals("callback", ignoreCase = true) == true
         ) {
-            if (uri.getQueryParameter("source") == "portal") {
-                onDone(uri.getQueryParameter("event"))
-                return true
-            }
-            val code = uri.getQueryParameter("code")
-            if (!code.isNullOrEmpty()) {
-                onCode(code)
-                return true
+            // The one Store Hand-back decoder (#615): the portal's Done, a
+            // "Change plan" card completed in-WebView (#592), or a plan switch
+            // with no checkout (#599) → Done (RESULT_OK), never an unknown-scheme load.
+            when (val handBack = classifyHandBack(
+                uri.getQueryParameter("source"), uri.getQueryParameter("event"),
+                uri.getQueryParameter("code"), uri.getQueryParameter("error"),
+            )) {
+                is HandBack.PortalClosed -> { onDone(handBack.event); return true }
+                is HandBack.Purchase -> { onCode(handBack.code); return true }
+                is HandBack.Switched -> { onStoreDone(handBack.reason); return true }
+                is HandBack.Error -> { onStoreCancel(); return true }
+                null -> {}
             }
         }
         // 3: the Stripe card surface → system browser.

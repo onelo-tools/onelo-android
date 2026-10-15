@@ -63,4 +63,16 @@ class OneloFeaturesEnvironmentTest {
         val params = featuresWith(null).pollParams(userId = "u1", version = 3)
         assertFalse(params.contains("environment"))
     }
+
+    // ADR-0003 / #105: the poll credential is the X-Publishable-Key header and
+    // is NOT in the query string (it lands in the proxy access.log on every
+    // tick, and the backend refuses `?key=` from 2027-03-31).
+    @Test
+    fun `poll sends key as X-Publishable-Key header and not in query params`() {
+        val f = featuresWith(null)
+        val params = f.pollParams(userId = "u1", version = 3)
+        assertFalse(params.contains("key="))
+        assertFalse(params.contains("onelo_pk_test_abc"))
+        assertEquals("onelo_pk_test_abc", f.pollHeaders()["X-Publishable-Key"])
+    }
 }

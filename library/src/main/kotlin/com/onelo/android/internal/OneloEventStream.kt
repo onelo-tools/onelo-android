@@ -34,9 +34,17 @@ internal typealias OneloEventHandler = (Map<String, Any?>) -> Unit
  *   • refuses to silently downgrade a user-bound stream back to anonymous,
  *   • a generation counter so a connect superseded mid-await never lingers.
  *
- * The stream authenticates via `key` + `userId` + `instance_id` query params
- * (no bearer on the stream itself); each event carries an `app_user_id` the
- * handler filters against the current user.
+ * The stream authenticates via the `X-Publishable-Key` request header
+ * (ADR-0003 — the key never enters the URL), alongside `userId` + `instance_id`
+ * query params. Each event carries an `app_user_id` the handler filters against
+ * the current user.
+ *
+ * The signed-in user is proven with `Authorization: Bearer <access token>`
+ * (#519), read fresh on EVERY (re)connect so a reconnect never carries an
+ * expired token (the server checks it at connect only). A refused token
+ * (`401 invalid_user_token`) is refreshed once and retried once; refused again,
+ * that connection is opened anonymous (no Bearer, no `userId`) and the next
+ * reconnect tries the user again. Same rules as the JS SDKs.
  */
 internal class OneloEventStream(
     private val apiUrl: String,
@@ -52,6 +60,10 @@ internal class OneloEventStream(
     // session.revoked / legal.consent_required) would be silently DEAD. Called fresh
     // per connect so a token fetched after the first connect rides later reconnects.
     private val securityHeaders: () -> Map<String, String> = { emptyMap() },
+    /** The signed-in user's access token, sent as `Authorization: Bearer` on every connect. */
+    private val userToken: UserTokenSource? = null,
+    /** Opens the HTTP connection; tests swap it to script the server's answers. */
+    private val openConnection: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
 ) {
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
     private val handlers = mutableMapOf<String, OneloEventHandler>()
@@ -60,6 +72,15 @@ internal class OneloEventStream(
     @Volatile private var running = false
     @Volatile private var generation = 0
     @Volatile private var attempt = 0
+    @Volatile private var userTokenRefusedWarned = false
+    /**
+     * The user the LIVE connection is actually bound to — null while connecting,
+     * for an anonymous connection, and for the refused-token anonymous fallback.
+     * Event handlers read it during dispatch so a features snapshot is applied
+     * only to the identity it was resolved for (#737).
+     */
+    @Volatile var connectionUserId: String? = null
+        private set
     private var connectJob: Job? = null
     // The live HTTP connection. Disconnected on supersede/stop so a blocking
     // readLine() unblocks immediately (coroutine cancel alone can't interrupt it).
@@ -115,6 +136,7 @@ internal class OneloEventStream(
         generation++
         running = false
         userId = null
+        connectionUserId = null
         connectJob?.cancel()
         connectJob = null
         disconnectActive()
@@ -124,6 +146,7 @@ internal class OneloEventStream(
     private fun open() {
         generation++
         attempt = 0
+        connectionUserId = null
         connectJob?.cancel()
         disconnectActive() // unblock the old readLine so the old socket dies now
         connectJob = scope.launch { connect(generation) }
@@ -134,37 +157,118 @@ internal class OneloEventStream(
         activeConn = null
     }
 
+    /**
+     * The Event Stream query string. It carries NO credential: ADR-0003 moved
+     * the Publishable Key to the `X-Publishable-Key` request header, because a
+     * key in the URL lands in the reverse proxy's access.log on every connect
+     * (and the backend stamps such a connection `Deprecation`/`Sunset`).
+     */
+    internal fun streamQuery(forUser: String?): String = buildString {
+        append("instance_id=").append(enc(instanceId))
+        append("&sdk_platform=android")
+        append("&sdk_version=").append(enc(sdkVersion))
+        forUser?.let { append("&userId=").append(enc(it)) }
+        environment?.let { append("&environment=").append(enc(it)) }
+    }
+
+    /**
+     * Request headers for the Event Stream connect. `X-Publishable-Key` is the
+     * stream's credential (ADR-0003). `securityHeaders()` is read fresh per
+     * connect so an integrity token fetched after the first connect rides later
+     * reconnects — without X-Bundle-Id the backend gate 403s a live app and
+     * realtime goes silently dead.
+     */
+    internal fun streamHeaders(token: String? = null): Map<String, String> = buildMap {
+        put("Accept", "text/event-stream")
+        put("X-Publishable-Key", publishableKey)
+        put("X-Sdk-Version", sdkVersion)
+        putAll(securityHeaders())
+        putAll(bearerHeaders(token))
+    }
+
+    /** Open one connection for [tokenAttempt] and wait for its status. Null when superseded. */
+    private suspend fun openOnce(gen: Int, tokenAttempt: UserTokenAttempt): Pair<HttpURLConnection, Int>? {
+        // A connection whose user token was refused is anonymous: no `userId`.
+        val q = streamQuery(if (tokenAttempt.anonymous) null else userId)
+        val reqHeaders = streamHeaders(tokenAttempt.token)
+        val conn = withContext(Dispatchers.IO) {
+            openConnection(URL("$apiUrl/api/sdk/features/stream?$q")).apply {
+                requestMethod = "GET"
+                instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
+                reqHeaders.forEach { (k, v) -> setRequestProperty(k, v) }
+                connectTimeout = 15_000
+                readTimeout = readTimeoutMs
+            }
+        }
+        if (gen != generation) { runCatching { conn.disconnect() }; return null }
+        activeConn = conn // now cancellable by disconnectActive()
+        val status = withContext(Dispatchers.IO) { conn.responseCode }
+        return conn to status
+    }
+
+    /** True when [conn] answered `401 invalid_user_token` (its body is read, then it is closed). */
+    private suspend fun refusedUserToken(conn: HttpURLConnection, status: Int): Boolean {
+        if (status != 401) return false
+        val body = withContext(Dispatchers.IO) {
+            runCatching { conn.errorStream?.bufferedReader()?.use { it.readText() } }.getOrNull()
+        }
+        val refused = runCatching { isUserTokenRefusal(status, jsonToMap(JSONObject(body ?: ""))) }.getOrDefault(false)
+        if (refused) withContext(Dispatchers.IO) { runCatching { conn.disconnect() } }
+        return refused
+    }
+
+    private fun warnUserTokenRefused() {
+        if (userTokenRefusedWarned) return
+        userTokenRefusedWarned = true
+        runCatching {
+            android.util.Log.w(
+                "Onelo",
+                "The signed-in user's access token was refused by the Event Stream (invalid_user_token) " +
+                    "even after a refresh, so the stream was opened without a user.",
+            )
+        }
+    }
+
     private suspend fun connect(gen: Int) {
         if (!running || gen != generation) return
         var conn: HttpURLConnection? = null
         try {
-            val q = buildString {
-                append("key=").append(enc(publishableKey))
-                userId?.let { append("&userId=").append(enc(it)) }
-                append("&instance_id=").append(enc(instanceId))
-                append("&sdk_platform=android")
-                append("&sdk_version=").append(enc(sdkVersion))
-                environment?.let { append("&environment=").append(enc(it)) }
-            }
-            conn = withContext(Dispatchers.IO) {
-                (URL("$apiUrl/api/sdk/features/stream?$q").openConnection() as HttpURLConnection).apply {
-                    requestMethod = "GET"
-                    instanceFollowRedirects = false  // see HttpClient.get() — headers follow the redirect
-                    setRequestProperty("Accept", "text/event-stream")
-                    setRequestProperty("X-Sdk-Version", sdkVersion)
-                    // X-Bundle-Id (+ X-Integrity-Token / instance id) — without it the
-                    // backend security gate 403s a live app and realtime goes dead.
-                    securityHeaders().forEach { (k, v) -> setRequestProperty(k, v) }
-                    connectTimeout = 15_000
-                    readTimeout = readTimeoutMs
+            // Read fresh on every (re)connect — never a cached, possibly expired token.
+            val token = userToken?.current()
+            if (gen != generation) return
+            var opened = openOnce(gen, UserTokenAttempt(token, anonymous = false)) ?: return
+            conn = opened.first
+            var sentToken = token
+            var anonymous = false
+            if (token != null && refusedUserToken(opened.first, opened.second)) {
+                // Refused: one refresh per refusal episode (shared with Features),
+                // one retry, then this connection goes anonymous.
+                val fresh = userToken?.refreshAfterRefusal()
+                if (gen != generation) return
+                var refusedAgain = true
+                if (fresh != null) {
+                    opened = openOnce(gen, UserTokenAttempt(fresh, anonymous = false)) ?: return
+                    conn = opened.first
+                    sentToken = fresh
+                    refusedAgain = refusedUserToken(opened.first, opened.second)
+                }
+                if (refusedAgain) {
+                    warnUserTokenRefused()
+                    opened = openOnce(gen, UserTokenAttempt(null, anonymous = true)) ?: return
+                    conn = opened.first
+                    sentToken = null
+                    anonymous = true
                 }
             }
-            if (gen != generation) return
-            activeConn = conn // now cancellable by disconnectActive()
-            val status = withContext(Dispatchers.IO) { conn.responseCode }
+            val status = opened.second
+            val live = opened.first
             if (status != 200) { scheduleReconnect(gen); return }
+            // A 200 on connect means the server checked and accepted the token.
+            if (sentToken != null) userToken?.accepted()
             attempt = 0 // connected — reset backoff
-            val reader = withContext(Dispatchers.IO) { BufferedReader(InputStreamReader(conn.inputStream)) }
+            if (gen != generation) return
+            connectionUserId = if (anonymous) null else userId
+            val reader = withContext(Dispatchers.IO) { BufferedReader(InputStreamReader(live.inputStream)) }
             var event: String? = null
             val data = StringBuilder()
             reader.use { r ->

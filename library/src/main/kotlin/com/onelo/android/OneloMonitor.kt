@@ -287,7 +287,8 @@ class OneloMonitor internal constructor(
         val previous = Thread.getDefaultUncaughtExceptionHandler()
         Thread.setDefaultUncaughtExceptionHandler { thread, throwable ->
             try {
-                push("unhandled", false, null, throwable.message, null, "global_error", throwable)
+                // meta.origin: whose error this is (#548) — see errorOrigin().
+                push("unhandled", false, null, throwable.message, mapOf("origin" to errorOrigin(throwable)), "global_error", throwable)
                 flushBlocking(2_000)
             } catch (_: Throwable) {
                 // never let our capture mask the original crash
@@ -705,4 +706,22 @@ class OneloMonitor internal constructor(
         is List<*> -> JSONArray(v.map { toJsonValue(it) })
         else -> v
     }
+}
+
+private val PLATFORM_FRAME_PREFIXES = listOf(
+    "java.", "javax.", "jdk.", "sun.", "kotlin.", "kotlinx.", "android.", "androidx.",
+    "dalvik.", "com.android.", "libcore.", "org.jetbrains.",
+)
+
+/**
+ * Whose error is an uncaught exception — the app's or the Onelo SDK's (#548)?
+ * Sent as `meta.origin` so the backend keeps the SDK's own errors out of the
+ * developer's Monitor data. A [OneloError] is the SDK's by construction;
+ * otherwise the first frame outside the platform/runtime (where the exception
+ * was thrown from code someone wrote) decides: `com.onelo.android.` → SDK.
+ */
+internal fun errorOrigin(t: Throwable): String {
+    if (t is OneloError) return "onelo_sdk"
+    val owner = t.stackTrace.firstOrNull { f -> PLATFORM_FRAME_PREFIXES.none { f.className.startsWith(it) } }
+    return if (owner?.className?.startsWith("com.onelo.android.") == true) "onelo_sdk" else "app"
 }

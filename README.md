@@ -50,6 +50,14 @@ lifecycleScope.launch {
 }
 ```
 
+To tell a closed sign-in apart from a failed one, use the overload with `onError`: it receives `OneloError` `CANCELLED` when the person closes the screen, or `SERVER` with the backend's reason:
+
+```kotlin
+val launcher = onelo.auth.registerLauncher(this, { session -> /* signed in */ }) { error ->
+    if (error.code != OneloError.Code.CANCELLED) showError(error.message)
+}
+```
+
 One nuance worth knowing: if the user is already authorized, `loadAuthView` returns a session directly and **nothing is launched** — the launcher callback never fires. A `null` return means a screen was opened and the result will arrive through the launcher instead.
 
 ### Deep links (required for most flows)
@@ -78,7 +86,7 @@ Everything below hangs off the one `onelo` instance.
 
 | Accessor | What it does | Key methods |
 |---|---|---|
-| `onelo.auth` | Hosted sign-in and sessions | `registerLauncher()`, `loadAuthView()`, `getSession()`, `whenReady()` |
+| `onelo.auth` | Hosted sign-in and sessions | `registerLauncher()`, `loadAuthView()`, `getSession()`, `whenReady()`, `signupMarketingConsent` |
 | `onelo.features` | Plan-gated feature flags | `declare()`, `feature()`, `ready()` |
 | `onelo.monitor` | Error and event reporting | `event()`, `track()`, `capture()`, `setUserId()` |
 | `onelo.paywall` | Your hosted store, on your own Stripe | `initiateStoreFlow()`, `cancelSubscription()` |
@@ -100,6 +108,17 @@ when {
     f.isGreyed()      -> showDisabledButton()
 }
 ```
+
+Await `ready()` once before you show gated UI — at launch and again after each sign-in. It returns when the server has confirmed the snapshot for the current user (bounded by its timeout); `feature()` itself is synchronous and reads the cache:
+
+```kotlin
+lifecycleScope.launch {
+    onelo.features.ready(1500)   // the restored or newly signed-in user's snapshot
+    showMainScreen()             // gated UI goes up only now
+}
+```
+
+Feature flags follow the signed-in Onelo user automatically: every Features call sends that user's access token, so the server knows who is asking. There is nothing to identify. `identify()` and its `userIdHash` argument still compile but are deprecated, and `userIdHash` is no longer sent.
 
 ## Security
 

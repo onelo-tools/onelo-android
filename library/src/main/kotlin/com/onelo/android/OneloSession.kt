@@ -32,6 +32,45 @@ data class OneloUser(
      * docs/sdk-access-gate-wiring.md.
      */
     val allowedIn: Boolean? = null,
+    /**
+     * Has this user proved their address receives mail (Email Verification,
+     * #819)? From the backend's `email_verified`; null when an older backend did
+     * not send it. OAuth, Magic Link and an e-mailed password reset count as
+     * verified.
+     */
+    val emailVerified: Boolean? = null,
+    /**
+     * Why [allowedIn] is false, when the server named a reason the app may
+     * branch on. Today only `"email_unverified"`: the parent App requires Email
+     * Verification and this user has not opened the link yet. Null when allowed
+     * in or when the reason is the paywall. Tolerate unknown values.
+     */
+    val accessReason: String? = null,
+) {
+    /**
+     * The server's access answer from a `/api/sdk/auth/user` body merged over
+     * this user (#819): [allowedIn], [emailVerified] and [accessReason] move
+     * together. A field the body does not carry keeps its stored value; when the
+     * body carries `allowed_in`, [accessReason] is taken from the body even when
+     * absent — the answer is complete and an old reason must not outlive it.
+     */
+    internal fun mergingAccessAnswer(body: Map<String, Any?>, entitlement: OneloEntitlement): OneloUser {
+        val answered = body["allowed_in"] is Boolean
+        return copy(
+            entitlement = entitlement,
+            allowedIn = if (answered) body["allowed_in"] as Boolean else allowedIn,
+            emailVerified = body["email_verified"] as? Boolean ?: emailVerified,
+            accessReason = if (answered) body["access_reason"] as? String else accessReason,
+        )
+    }
+}
+
+/** The result of [OneloAuth.resendVerificationEmail] (#819). */
+data class OneloVerificationResend(
+    /** A new e-mail went out; the previous link stopped working. */
+    val sent: Boolean,
+    /** The address was already verified, so nothing was sent. */
+    val emailVerified: Boolean,
 )
 
 data class OneloSession(

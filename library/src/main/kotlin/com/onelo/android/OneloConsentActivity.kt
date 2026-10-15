@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
 import android.os.Bundle
+import com.onelo.android.internal.paintGround
+import com.onelo.android.internal.tint
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebResourceError
@@ -73,6 +75,11 @@ class OneloConsentActivity : AppCompatActivity() {
         webView = WebView(this).apply {
             settings.javaScriptEnabled = true
             settings.domStorageEnabled = true
+        }
+        // #681 — ground and progress arc from the brand tokens (no white flash).
+        OneloBrandChrome.from(OneloBrand.current).let { brand ->
+            brand.paintGround(container, webView)
+            brand.tint(progressBar)
         }
         container.addView(
             webView,

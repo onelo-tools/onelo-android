@@ -3,8 +3,12 @@ package com.onelo.android
 import android.annotation.SuppressLint
 import android.app.Activity
 import android.content.Intent
+import android.graphics.Color
 import android.os.Bundle
+import com.onelo.android.internal.paintGround
+import com.onelo.android.internal.tint
 import android.os.Message
+import android.view.Gravity
 import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
@@ -13,7 +17,9 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import android.widget.FrameLayout
+import android.widget.LinearLayout
 import android.widget.ProgressBar
+import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import androidx.lifecycle.lifecycleScope
 import com.onelo.android.internal.applyStatusBarInsetPadding
@@ -65,11 +71,32 @@ internal fun isOneloOAuthUrl(url: String): Boolean {
         path == "/api/sdk/auth/oauth/apple"
 }
 
+/** Result of re-resolving a spent hosted-flow token. */
+internal sealed class FreshFlowAction {
+    object Authorized : FreshFlowAction()
+    data class Present(val url: String) : FreshFlowAction()
+    /** The SDK could not resolve a replacement URL; keep the flow open for retry. */
+    object RetryableError : FreshFlowAction()
+}
+
 class OneloAuthActivity : AppCompatActivity() {
 
     companion object {
         const val EXTRA_URL = "onelo_auth_url"
         const val EXTRA_CODE = "onelo_code"
+        /**
+         * Result extra (RESULT_OK, no [EXTRA_CODE]): the store finished a plan switch
+         * with no checkout (#599) — the reason (`plan_switched` | `switch_scheduled`).
+         * No code to exchange; [OneloAuth.registerLauncher] resolves the current session.
+         */
+        const val EXTRA_STORE_DONE = "onelo_store_done"
+        /**
+         * Result extra (RESULT_OK, no code): re-resolving an expired hosted URL
+         * found that the caller is already authorized. The Activity must finish
+         * as a success so [OneloAuth.registerLauncher] can return the session,
+         * matching Electron's authorized re-resolve path.
+         */
+        const val EXTRA_AUTHORIZED = "onelo_auth_authorized"
         /**
          * Intent extra: the deep-link callback scheme ([OneloConfig.callbackScheme]).
          * The hosted sign-in page signals success by REDIRECTING to
@@ -109,10 +136,10 @@ class OneloAuthActivity : AppCompatActivity() {
         var pendingGateReturn: ((String) -> Unit)? = null
 
         /**
-         * Supplies a FRESH hosted URL when the page hands control back saying its
-         * addressing token is spent (`?error=invalid_token`). Set by
-         * [OneloAuth.loadAuthView] before launching; returns null if the flow can
-         * no longer be resolved.
+         * Supplies a FRESH flow decision when the page hands control back saying
+         * its addressing token is spent (`?error=invalid_token`). Set by
+         * [OneloAuth.loadAuthView] before launching. The decision may be a new
+         * hosted URL or `authorized` when the user completed the flow elsewhere.
          *
          * Same static-hook idiom as [pendingExternalReturn] — the Activity is
          * started by the framework and has no reference to the SDK instance.
@@ -124,7 +151,7 @@ class OneloAuthActivity : AppCompatActivity() {
          */
         @Volatile
         @JvmStatic
-        var pendingFreshUrl: (suspend () -> String?)? = null
+        var pendingFreshDecision: (suspend () -> OneloAuth.FlowDecision)? = null
 
         /**
          * Is this `?error=` value the hosted page saying its addressing token is
@@ -138,10 +165,26 @@ class OneloAuthActivity : AppCompatActivity() {
         @JvmStatic
         internal fun isExpiredAuthError(err: String?): Boolean =
             err == "invalid_token" || err == "expired_token" || err == "token_expired"
+
+        /** Does this hand-back mean "the link is spent, load a fresh one" (#619)?
+         *  The store's `{type:'onelo:cancel', reason:'expired'}` decodes to
+         *  `Error("token_expired")`; a plain cancel stays a cancel. */
+        internal fun restartsOnHandBack(hb: HandBack): Boolean =
+            hb is HandBack.Error && isExpiredAuthError(hb.error)
+
+        /** Keep the Activity's terminal/result routing pure and unit-testable. */
+        internal fun freshFlowAction(decision: OneloAuth.FlowDecision?): FreshFlowAction =
+            when (decision) {
+                is OneloAuth.FlowDecision.Authorized -> FreshFlowAction.Authorized
+                is OneloAuth.FlowDecision.Present -> FreshFlowAction.Present(decision.url)
+                null -> FreshFlowAction.RetryableError
+            }
     }
 
     private lateinit var webView: WebView
     private lateinit var progressBar: ProgressBar
+    private lateinit var container: FrameLayout
+    private var retryView: View? = null
     private var resultDelivered = false
     // Default matches OneloConfig.callbackScheme's default so a missing extra still works.
     private var callbackScheme: String = "oneloandroid"
@@ -159,7 +202,7 @@ class OneloAuthActivity : AppCompatActivity() {
         intent.getStringExtra(EXTRA_SCHEME)?.takeIf { it.isNotBlank() }?.let { callbackScheme = it }
 
         // Build layout programmatically — no XML resources needed in the library
-        val container = FrameLayout(this)
+        container = FrameLayout(this)
         progressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             isIndeterminate = true
             visibility = View.VISIBLE
@@ -182,6 +225,11 @@ class OneloAuthActivity : AppCompatActivity() {
         // stuck. The URL was already validated by Onelo.handleRedirect before this
         // hook is invoked (isOneloHostedSurface), so no re-check is needed here.
         pendingGateReturn = { url -> runOnUiThread { if (!isFinishing) webView.loadUrl(url) } }
+        // #681 — ground and progress arc from the brand tokens (no white flash).
+        OneloBrandChrome.from(OneloBrand.current).let { brand ->
+            brand.paintGround(container, webView)
+            brand.tint(progressBar)
+        }
         container.addView(webView, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT,
             FrameLayout.LayoutParams.MATCH_PARENT
@@ -210,13 +258,17 @@ class OneloAuthActivity : AppCompatActivity() {
                 if (uri.scheme.equals(callbackScheme, ignoreCase = true) &&
                     uri.host.equals("callback", ignoreCase = true)
                 ) {
-                    val code = uri.getQueryParameter("code")
-                    val error = uri.getQueryParameter("error")
-                    val expired = isExpiredAuthError(error)
+                    // The one Store Hand-back decoder (#615).
+                    val handBack = classifyHandBack(
+                        uri.getQueryParameter("source"), uri.getQueryParameter("event"),
+                        uri.getQueryParameter("code"), uri.getQueryParameter("error"),
+                    )
                     val gate = uri.getQueryParameter("gate")
                     when {
-                        !code.isNullOrBlank() -> deliverCode(code)
-                        expired -> reloadFreshHostedUrl()
+                        handBack is HandBack.Purchase -> deliverCode(handBack.code)
+                        // Plan switch with no checkout (#599) — a success, not a cancel.
+                        handBack is HandBack.Switched -> deliverStoreDone(handBack.reason)
+                        handBack is HandBack.Error && isExpiredAuthError(handBack.error) -> reloadFreshHostedUrl()
                         // A refusal reached IN this WebView (no browser hand-off
                         // involved) — load it in place, same surface. This value
                         // came from a navigation inside a page we already loaded
@@ -280,14 +332,11 @@ class OneloAuthActivity : AppCompatActivity() {
                 // Inject postMessage listener — same protocol as React Native SDK
                 view?.evaluateJavascript("""
                     (function() {
+                        ${HAND_BACK_RELAY_SNIPPET}
                         window.addEventListener('message', function(e) {
                             try {
                                 var data = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
-                                if (data && data.type === 'onelo:code' && data.code) {
-                                    OneloAndroid.onCode(data.code);
-                                } else if (data && data.type === 'onelo:cancelled') {
-                                    OneloAndroid.onCancelled();
-                                }
+                                oneloHandBack(data);
                             } catch(err) {}
                         });
                     })();
@@ -352,7 +401,10 @@ class OneloAuthActivity : AppCompatActivity() {
         if (!isChangingConfigurations) {
             pendingExternalReturn = null
             pendingGateReturn = null
-            pendingFreshUrl = null
+            // Keep the flow resolver alive until a terminal result is delivered.
+            // The framework may destroy and recreate this Activity without a
+            // process death; clearing it here turns the next expired callback
+            // into a silent cancellation.
         }
         super.onDestroy()
     }
@@ -363,6 +415,12 @@ class OneloAuthActivity : AppCompatActivity() {
             super.onBackPressed()
             return
         }
+        if (retryView != null) {
+            // Back is an explicit user cancellation. A failed refresh itself stays
+            // retryable and must not finish the Activity silently.
+            deliverCancelled()
+            return
+        }
         if (webView.canGoBack()) {
             webView.goBack()
         } else {
@@ -371,16 +429,18 @@ class OneloAuthActivity : AppCompatActivity() {
     }
 
     /**
-     * The addressing token is spent — re-resolve the flow and load the URL it
-     * gives us (now a clean sign-in page, since the session was just revoked).
-     * Falls back to cancelling if the flow can't be resolved, which is the old
-     * behaviour and still better than a frozen WebView.
+     * The addressing token is spent — re-resolve the flow and either load the
+     * fresh URL it gives us or finish successfully when the backend says this
+     * caller is already authorized. Electron follows the same authorized path.
      */
     private fun reloadFreshHostedUrl() {
-        val supplier = pendingFreshUrl
-        if (supplier == null) { deliverCancelled(); return }
+        val supplier = pendingFreshDecision
+        if (supplier == null) {
+            showRetryableError()
+            return
+        }
         lifecycleScope.launch {
-            val fresh = try {
+            val decision = try {
                 supplier()
             } catch (e: Exception) {
                 // Never swallow silently — a dead reload is the difference between
@@ -388,13 +448,78 @@ class OneloAuthActivity : AppCompatActivity() {
                 android.util.Log.w("Onelo", "reload after expiry failed: ${e.message}")
                 null
             }
-            if (fresh != null && !isFinishing) webView.loadUrl(fresh) else deliverCancelled()
+            when (val action = freshFlowAction(decision)) {
+                FreshFlowAction.Authorized -> deliverAuthorized()
+                is FreshFlowAction.Present -> {
+                    if (!isFinishing) {
+                        retryView?.let {
+                            container.removeView(it)
+                            retryView = null
+                        }
+                        progressBar.visibility = View.VISIBLE
+                        webView.loadUrl(action.url)
+                    }
+                }
+                FreshFlowAction.RetryableError -> showRetryableError()
+            }
         }
+    }
+
+    /** Keep the auth Activity open when a spent-link recovery cannot resolve yet. */
+    private fun showRetryableError() {
+        if (isFinishing || !::container.isInitialized) return
+
+        retryView?.let(container::removeView)
+        val retry = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(48, 48, 48, 48)
+            setBackgroundColor(Color.rgb(17, 17, 17))
+        }
+        val message = TextView(this).apply {
+            text = "We couldn't refresh sign-in. Check your connection and try again."
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            textSize = 16f
+        }
+        val button = android.widget.Button(this).apply {
+            text = "Try again"
+            setOnClickListener {
+                container.removeView(retry)
+                retryView = null
+                progressBar.visibility = View.VISIBLE
+                reloadFreshHostedUrl()
+            }
+        }
+        retry.addView(
+            message,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ),
+        )
+        retry.addView(
+            button,
+            LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+            ).apply { gravity = Gravity.CENTER; topMargin = 24 },
+        )
+        retryView = retry
+        progressBar.visibility = View.GONE
+        container.addView(
+            retry,
+            FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT,
+                FrameLayout.LayoutParams.MATCH_PARENT,
+            ),
+        )
     }
 
     private fun deliverCode(code: String) {
         if (resultDelivered) return
         resultDelivered = true
+        pendingFreshDecision = null
         val data = Intent().putExtra(EXTRA_CODE, code)
         setResult(Activity.RESULT_OK, data)
         finish()
@@ -403,19 +528,42 @@ class OneloAuthActivity : AppCompatActivity() {
     private fun deliverCancelled() {
         if (resultDelivered) return
         resultDelivered = true
+        pendingFreshDecision = null
         setResult(Activity.RESULT_CANCELED)
         finish()
     }
 
-    private inner class OneloBridge {
-        @JavascriptInterface
-        fun onCode(code: String) {
-            runOnUiThread { deliverCode(code) }
-        }
+    private fun deliverStoreDone(reason: String) {
+        if (resultDelivered) return
+        resultDelivered = true
+        pendingFreshDecision = null
+        setResult(Activity.RESULT_OK, Intent().putExtra(EXTRA_STORE_DONE, reason))
+        finish()
+    }
 
+    private fun deliverAuthorized() {
+        if (resultDelivered) return
+        resultDelivered = true
+        pendingFreshDecision = null
+        setResult(Activity.RESULT_OK, Intent().putExtra(EXTRA_AUTHORIZED, true))
+        finish()
+    }
+
+    private inner class OneloBridge {
+        /** The store's postMessage hand-back (#627), decoded by the one decoder. */
         @JavascriptInterface
-        fun onCancelled() {
-            runOnUiThread { deliverCancelled() }
+        fun onHandBack(type: String, code: String, reason: String) {
+            val handBack = classifyHandBackMessage(type, code, reason) ?: return
+            runOnUiThread {
+                when {
+                    handBack is HandBack.Purchase -> deliverCode(handBack.code)
+                    handBack is HandBack.Switched -> deliverStoreDone(handBack.reason)
+                    // The store's link died (#619): reload a fresh one in place,
+                    // exactly as the `?error=token_expired` deep link does.
+                    restartsOnHandBack(handBack) -> reloadFreshHostedUrl()
+                    else -> deliverCancelled()
+                }
+            }
         }
     }
 }

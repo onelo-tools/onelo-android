@@ -91,6 +91,7 @@ class OneloPaywall(
                 "store-initiate failed: HTTP ${resp.status}" + (code?.let { " ($it)" } ?: ""),
             )
         }
+        OneloBrand.adopt(resp.body) // #681: store-initiate carries brand_tokens
         return resp.body["store_url"] as? String
             ?: throw OneloError.server("store-initiate response missing store_url")
     }

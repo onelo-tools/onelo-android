@@ -12,13 +12,18 @@ class OneloWaitlist(
     private val securityHeaders: () -> Map<String, String> = { emptyMap() },
 ) {
 
-    suspend fun join(email: String, slug: String? = null): WaitlistResult {
+    /**
+     * Join a waitlist. [consent] (#818): the checkboxes your form showed —
+     * Marketing Consent and the waitlist's custom checkbox. Omitted, none is sent.
+     */
+    suspend fun join(email: String, slug: String? = null, consent: OneloWaitlistConsent? = null): WaitlistResult {
         return try {
             val body = mutableMapOf<String, Any?>(
                 "publishableKey" to config.publishableKey,
                 "email" to email,
             )
             if (slug != null) body["slug"] = slug
+            consent?.wireValue()?.let { body["consent"] = it }
             val headers = mapOf(
                 "X-Publishable-Key" to config.publishableKey,
                 "X-SDK-Version" to SDK_VERSION,

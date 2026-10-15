@@ -8,6 +8,8 @@ import com.onelo.android.internal.HttpClient
 import java.net.URLEncoder
 import com.onelo.android.internal.OneloEventStream
 import com.onelo.android.internal.SecureStorage
+import com.onelo.android.internal.UserTokenEpisode
+import com.onelo.android.internal.UserTokenSource
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -24,8 +26,16 @@ class Onelo(private val config: OneloConfig, context: Context) {
     // so it safely reads instanceId/attestedBundleId/integrityToken declared below.
     val monitor: OneloMonitor = OneloMonitor(config, context, securityHeaders = { securityHeaders() })
     val auth: OneloAuth = OneloAuth(config, context) { securityHeaders() }
-    val features: OneloFeatures = OneloFeatures(config, monitor, context)
-    val feedback: OneloFeedback = OneloFeedback(config, features) { securityHeaders() }
+
+    // The signed-in user's access token, proving the user on every Features call
+    // and on the Event Stream connect (#519). getSession() refreshes a token near
+    // expiry, so a stale one is never sent; signed out → null → no token.
+    private val userToken = UserTokenSource(
+        readCurrent = { auth.getSession()?.accessToken },
+        readRefreshed = { auth.refreshSession()?.accessToken },
+    )
+    val features: OneloFeatures = OneloFeatures(config, monitor, context, userToken = userToken)
+    val feedback: OneloFeedback = OneloFeedback(config, features, { securityHeaders() }, userToken)
     val paywall: OneloPaywall = OneloPaywall(config) { securityHeaders() }
     val customerPortal: OneloCustomerPortal = OneloCustomerPortal(config, context) { securityHeaders() }
     val consent: OneloConsent = OneloConsent(config, context)
@@ -52,10 +62,21 @@ class Onelo(private val config: OneloConfig, context: Context) {
         // with a registered bundle isn't 403'd → realtime stays alive. Same provider
         // paywall uses; called per-connect so a token fetched post-init rides reconnects.
         securityHeaders = { securityHeaders() },
+        userToken = userToken,
+    )
+
+    private val planChange = PlanChangeRefresher(
+        scope = scope,
+        refreshFeatures = { features.refresh(force = true) },
+        revalidateEntitlement = { auth.revalidateEntitlement() },
+        snapshot = { features.snapshotKey() },
     )
 
     fun securityHeaders(): Map<String, String> {
         val headers = mutableMapOf<String, String>()
+        // Version + name together (#122) — every request through here is one the
+        // dashboard's version capture may read.
+        headers.putAll(sdkIdentityHeaders())
         headers["X-Onelo-Instance-Id"] = instanceId
         // WHICH OS. Always "android" here, and always accurate — which is the
         // point: /api/sdk/config suppresses the "Require plan on sign-up" gate
@@ -73,6 +94,14 @@ class Onelo(private val config: OneloConfig, context: Context) {
         // (Crashlytics) still runs. Global crashes ship as `global_error` events.
         monitor.registerGlobalHandlers()
         registerSseHandlers()
+        // #737: seed Features with the STORED user synchronously, so feature() reads
+        // that user's persisted snapshot from the first frame and ready() waits for
+        // that user — never for an anonymous snapshot that a restore then replaces.
+        features.bindIdentity(auth.peekSession()?.user?.id)
+        // #659: a purchase / plan switch handed back by any hosted Activity
+        // reconciles features + entitlement at once, instead of waiting for the
+        // stream. One refresher, so the containers cannot drift.
+        auth.planChangeHandler = { change -> planChange.handBack(change) }
         scope.launch {
             // Reuse the auth module's Play Integrity attestation instead of running
             // a second, independent one: ONE /api/sdk/config fetch + ONE Standard-API
@@ -81,14 +110,24 @@ class Onelo(private val config: OneloConfig, context: Context) {
             // integrity token before completing whenReady().
             auth.whenReady()
             integrityToken = auth.currentIntegrityToken()
-            // Anonymous realtime kickstart so features-only apps get live updates
-            // before any sign-in (re-targeted to the user when auth signs in below).
-            eventStream.ensureStarted(null)
-            features.load(null, securityHeaders())
+            // #737: bind Features to the RESTORED user, not anonymous. A stored
+            // session is never emitted on onAuthStateChange at launch, so loading
+            // null here left a returning user's features resolved as "anon" (with
+            // their Bearer, then persisted under the anon key) for the whole run.
+            val restored = runCatching { auth.getSession()?.user?.id }.getOrNull()
+            if (restored != null) eventStream.start(restored)
+            else eventStream.ensureStarted(null) // anonymous realtime before any sign-in
+            features.load(restored, securityHeaders())
         }
         scope.launch {
+            val episode = UserTokenEpisode(userToken)
             auth.onAuthStateChange().collect { session ->
                 val userId = session?.user?.id
+                // A different user starts a new token-refusal episode. The same
+                // user (a refresh re-emitting the session) does not: that is what
+                // keeps a persistently refused token from looping refresh → load
+                // → refresh, since every emission reloads features below.
+                episode.onSession(userId)
                 // Tag monitor events with the signed-in user (parity with Swift/Flutter).
                 // Was the known Android bug: post-login events shipped userId=null.
                 monitor.setUserId(userId)
@@ -112,32 +151,47 @@ class Onelo(private val config: OneloConfig, context: Context) {
     /** Wire the shared realtime stream to the modules. Keys are disjoint per module. */
     private fun registerSseHandlers() {
         eventStream.on("session.revoked") { data -> auth.handleRemoteRevoke(data["app_user_id"] as? String) }
+        // #635: this user's grant changed (purchase, switch, refund, pause…). The
+        // backend sends it only to this user's streams, right after the fresh
+        // `features_updated`; re-read the entitlement so hasActiveAccess follows.
+        eventStream.on("paywall.access_changed") {
+            scope.launch { try { auth.revalidateEntitlement() } catch (_: Exception) { /* best-effort */ } }
+        }
         eventStream.on("legal.consent_required") { consent.onRemoteConsentRequired() }
         // `connected` (full snapshot on every reconnect) + `features_updated` (fresh
         // snapshot) + `up_to_date` (cursor only) all route through applySseSnapshot —
         // it applies `features` when present and always advances the version cursor.
-        eventStream.on("connected") { data -> features.applySseSnapshot(data) }
-        eventStream.on("up_to_date") { data -> features.applySseSnapshot(data) }
-        eventStream.on("features_updated") { data -> features.applySseSnapshot(data) }
+        // The connection's bound user rides along: a frame from an anonymous
+        // (refused-token fallback) connection never lands on a signed-in user (#737).
+        eventStream.on("connected") { data -> features.applySseSnapshot(data, eventStream.connectionUserId) }
+        eventStream.on("up_to_date") { data -> features.applySseSnapshot(data, eventStream.connectionUserId) }
+        eventStream.on("features_updated") { data -> features.applySseSnapshot(data, eventStream.connectionUserId) }
         eventStream.on("discovery_requested") { features.onDiscoveryRequested() }
     }
 
     /**
-     * Only needed when NOT using Onelo Auth (own auth system). Pass [userIdHash]
-     * (`HMAC-SHA256(secret_key, "user:" + userId)`, computed on YOUR backend) to
-     * use Secure Mode so per-user targeting can't be spoofed with a raw userId.
+     * Deprecated: the signed-in Onelo user is used automatically. Onelo Auth is
+     * mandatory (#511), and every Features call proves that user with their
+     * access token, so there is nothing to identify. [userIdHash] is ignored
+     * (Secure Mode is retired). Kept so existing code compiles.
+     *
+     * Without an Onelo session the id is still sent unverified until the server
+     * stops trusting it (#521); with one, the token decides the user.
      */
-    suspend fun identify(userId: String, userIdHash: String? = null) {
+    @Deprecated("The signed-in Onelo user is used automatically; Features calls prove them with their access token. userIdHash is ignored.")
+    suspend fun identify(userId: String, @Suppress("UNUSED_PARAMETER") userIdHash: String? = null) {
         monitor.setUserId(userId)
-        features.load(userId, securityHeaders(), userIdHash)
+        features.load(userId, securityHeaders())
     }
 
     /**
-     * Resolve the upgrade destination for [plan] and open it in the SYSTEM browser.
-     * The BACKEND decides the target (single source of truth for billing state):
-     * an active subscriber lands on the hosted manage page with the plan pinned
-     * ("Change plan" — the link never executes the change itself); a user without a
-     * subscription lands on the hosted store. Requires a signed-in user (no-op +
+     * Resolve the upgrade destination for [plan] and open it in the SDK's portal
+     * Activity (#606). The BACKEND decides the target (single source of truth for
+     * billing state): an active subscriber lands on the plan switch with the plan
+     * pinned (the link never executes the change itself); a user without a paid plan
+     * lands on the hosted store; with plan changes off, the portal explains it. The
+     * store's hand-back closes the Activity, the entitlement is re-read, and the new
+     * plan reaches `features` over the Event Stream. Requires a signed-in user (no-op +
      * Logcat warning otherwise). 1:1 with Swift `Onelo.openUpgrade(forPlan:)`.
      *
      * Call this from an "Available in <plan>" upsell tap (features carrying
@@ -163,7 +217,7 @@ class Onelo(private val config: OneloConfig, context: Context) {
                 // is REQUIRED: the backend's validate_sdk_request_security gate 403s a
                 // live mobile app with a registered bundle when X-Bundle-Id is missing.
                 // Swift's HTTP client injects these on every request — we must too.
-                mapOf("Authorization" to "Bearer $token", "X-SDK-Version" to SDK_VERSION) + securityHeaders(),
+                mapOf("Authorization" to "Bearer $token") + securityHeaders(),
             )
             if (resp.status != 200) {
                 val code = extractErrorCode(resp.body)
@@ -182,22 +236,21 @@ class Onelo(private val config: OneloConfig, context: Context) {
                 }
                 return
             }
+            OneloBrand.adopt(resp.body) // #681: upgrade-initiate carries brand_tokens
             resp.body["upgrade_url"] as? String
                 ?: run { Log.w("Onelo", "openUpgrade: malformed upgrade-initiate response"); return }
         } catch (e: Exception) {
             Log.w("Onelo", "openUpgrade failed: ${e.message}")
             return
         }
-        // System browser (ACTION_VIEW) on the MAIN thread — parity with Swift @MainActor
-        // and the OAuth path (OneloAuth). NEW_TASK because we launch from app context.
-        // Wrapped: a device with no browser throws ActivityNotFoundException, which must
-        // degrade to a warning, not crash (best-effort, like every other exit here).
+        // #606 — the SDK's own portal Activity, not the system browser: a browser tab
+        // never hands a finished purchase or plan switch back. The Activity decodes
+        // every hand-back, closes itself and re-reads the entitlement. Main thread,
+        // NEW_TASK (started from the application context). Wrapped: a start failure
+        // degrades to a warning, never a crash.
         withContext(Dispatchers.Main) {
             try {
-                appContext.startActivity(
-                    Intent(Intent.ACTION_VIEW, Uri.parse(upgradeUrl))
-                        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-                )
+                customerPortal.openUpgradeUrl(auth, upgradeUrl)
             } catch (e: Exception) {
                 Log.w("Onelo", "openUpgrade: cannot open $upgradeUrl — ${e.message}")
             }
