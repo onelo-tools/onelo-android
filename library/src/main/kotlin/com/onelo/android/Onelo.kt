@@ -41,6 +41,10 @@ class Onelo(private val config: OneloConfig, context: Context) {
     val consent: OneloConsent = OneloConsent(config, context)
     val forms: OneloForms = OneloForms(config) { securityHeaders() }
     val waitlist: OneloWaitlist = OneloWaitlist(config) { securityHeaders() }
+    /** Affiliate referral capture (#929): `affiliates.capture(url, consent)`. */
+    val affiliates: OneloAffiliates = OneloAffiliates.create(config, context, { securityHeaders() }) {
+        auth.getSession()?.let { it.accessToken to it.user.id }
+    }
 
     // Stable per-install id — sent as X-Onelo-Instance-Id (fixes the test-env
     // batch-ping 403) and the identity the realtime SSE stream binds to.
@@ -137,6 +141,8 @@ class Onelo(private val config: OneloConfig, context: Context) {
                     // outstanding for this freshly signed-in user (parity with the
                     // other SDKs). No-op unless a launcher is registered + resumed.
                     consent.notifySignedIn()
+                    // #929: a referral kept on this device goes to the user who signs in.
+                    launch { runCatching { affiliates.claimForSession() } }
                 } else {
                     // Explicit sign-out / remote-revoke → drop the user binding and
                     // re-bind anonymously (ensureStarted alone never downgrades).

@@ -223,13 +223,17 @@ object OneloBrand {
     }
 }
 
+/** Soft skeleton fill: card colour on a dark page; border colour on a light
+ *  page, where the card equals the ground (#948, matches onelo-core). */
+internal fun OneloBrandTokens.skeletonSoftFill(): String = if (lightBg) border else cardBg
+
 /** Shimmer placeholder CSS for WebView skeletons (`.sk` soft, `.strong` field). */
 internal fun OneloBrandTokens.skeletonCss(): String {
     val sweep = "background-image:linear-gradient(90deg,transparent 0%,$spinnerTrack 50%,transparent 100%);" +
         "background-size:60vw 100%;background-repeat:no-repeat;background-attachment:fixed;" +
         "animation:onelo-shimmer 2.4s linear infinite"
     return "@keyframes onelo-shimmer{0%{background-position:-60vw 0}100%{background-position:100vw 0}}\n" +
-        ".sk{background-color:$cardBg;$sweep;border-radius:${fieldRadius.toInt()}px}\n" +
+        ".sk{background-color:${skeletonSoftFill()};$sweep;border-radius:${fieldRadius.toInt()}px}\n" +
         ".strong{background-color:$border;$sweep;border-radius:${fieldRadius.toInt()}px}"
 }
 
@@ -262,24 +266,30 @@ ${t.skeletonCss()}
 </body></html>"""
 
 /** Feedback-form skeleton (icon, title, three type cards, two fields, CTA). */
+/** #948: mirrors the hosted feedback page (see onelo-core feedbackSkeletonHtml). */
 internal fun oneloFeedbackSkeletonHtml(t: OneloBrandTokens): String = """<!DOCTYPE html><html><head>
-<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:${t.pageBg};font-family:${t.bodyFont};padding:40px 36px 32px;overflow:hidden}
+body{background:${t.pageBg};font-family:${t.bodyFont};padding:24px 24px 0;overflow:hidden}
 ${t.skeletonCss()}
-.icon{width:64px;height:64px;border-radius:${t.cardRadius.toInt()}px;margin:0 auto 16px}
-.title{width:220px;height:22px;margin:0 auto 40px}
-.cards{display:flex;gap:12px;margin-bottom:32px}
-.card{flex:1;height:76px;border-radius:${t.cardRadius.toInt()}px}
-.label{width:60px;height:13px;margin-bottom:8px}
-.input{width:100%;height:44px;margin-bottom:24px}
-.textarea{width:100%;height:110px;margin-bottom:32px}
+.icon{width:64px;height:64px;border-radius:${t.cardRadius.toInt()}px;margin:0 auto 14px}
+.col{width:100%;max-width:360px;margin:0 auto;display:flex;flex-direction:column;gap:16px}
+.title{width:220px;height:22px;margin:0 auto 4px}
+.cards{display:flex;gap:8px}
+.card{flex:1;height:56px;border-radius:${t.cardRadius.toInt()}px}
+.field{display:flex;flex-direction:column;gap:6px}
+.label{width:60px;height:13px}
+.input{width:100%;height:44px}
+.textarea{width:100%;height:100px}
 .btn{width:100%;height:48px;border-radius:${t.buttonRadius.toInt()}px}
 </style></head><body>
-<div class="sk icon"></div><div class="sk title"></div>
+<div class="sk icon"></div>
+<div class="col">
+<div class="sk title"></div>
 <div class="cards"><div class="sk card"></div><div class="sk card"></div><div class="sk card"></div></div>
-<div class="sk label"></div><div class="strong input"></div>
-<div class="sk label"></div><div class="strong textarea"></div>
+<div class="field"><div class="sk label"></div><div class="strong input"></div></div>
+<div class="field"><div class="sk label"></div><div class="strong textarea"></div></div>
 <div class="strong btn"></div>
+</div>
 </body></html>"""

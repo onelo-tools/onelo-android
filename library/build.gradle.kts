@@ -12,7 +12,7 @@ plugins {
 // namespace verified on central.sonatype.com). `version` is the line the Publish
 // SDK / Release workflows grep, so keep the `version = "…"` shape.
 group = "tools.onelo"
-version = "1.56.0"
+version = "1.57.0"
 
 android {
     namespace = "com.onelo.android"

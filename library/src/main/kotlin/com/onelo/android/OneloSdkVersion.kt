@@ -7,7 +7,7 @@ package com.onelo.android
 // release, _release-sdk.yml, does rewrite this file too since #110 — see
 // scripts/sdk-release-rewrite.sh — but Maven Central is the channel that ships
 // the string as-is, so the suffix stays banned.)
-internal const val SDK_VERSION = "1.56.0"
+internal const val SDK_VERSION = "1.57.0"
 
 // Registry key the dashboard compares SDK_VERSION against
 // (`LATEST_SDK_VERSIONS["onelo-android"]`). Sent as `X-Onelo-Sdk-Name` next to

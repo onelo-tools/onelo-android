@@ -72,7 +72,9 @@ class BrandTokensTest {
         val t = OneloBrandTokens.parse(served)
         val sk = oneloPortalSkeletonHtml(t)
         assertTrue(sk.contains("body{background:#f5f5f4"))
-        assertTrue(sk.contains("background-color:#ffffff"))
+        // #948: light page → soft blocks take the border colour (card = ground).
+        assertTrue(sk.contains(".sk{background-color:#e4e4e7"))
+        assertTrue(t.copy(lightBg = false).skeletonCss().contains(".sk{background-color:${t.cardBg}"))
         assertTrue(sk.contains("border-radius:21px"))
         assertFalse(sk.contains("rgba(255,255,255,0.04)"))
         val fb = oneloFeedbackSkeletonHtml(t)
