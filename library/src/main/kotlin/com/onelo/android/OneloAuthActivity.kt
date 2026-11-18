@@ -477,13 +477,13 @@ class OneloAuthActivity : AppCompatActivity() {
             setBackgroundColor(Color.rgb(17, 17, 17))
         }
         val message = TextView(this).apply {
-            text = "We couldn't refresh sign-in. Check your connection and try again."
+            text = OneloText.COULD_NOT_REFRESH_SIGN_IN.text()
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
             textSize = 16f
         }
         val button = android.widget.Button(this).apply {
-            text = "Try again"
+            text = OneloText.TRY_AGAIN.text()
             setOnClickListener {
                 container.removeView(retry)
                 retryView = null

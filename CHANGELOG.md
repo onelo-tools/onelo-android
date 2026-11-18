@@ -5,6 +5,37 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.61.0] — 2026-11-18
+
+### Added
+
+- The SDK's own texts follow the App User's Page Language: the auth window's "Try again" screen, the "Close" button of the feedback and customer-portal windows, the feature badges (`badgeLabel`: "New", "Beta", "Coming soon", "Available in <plan>", "Change plan") and the `OneloError` messages an App User may be shown (not signed in, network error, cancelled, session ended, account suspended, no active plan, verification e-mails). Onelo translates them into en, pl, de, fr, es, it, pt (European) and nl; plan names and your own texts stay as written (#1075).
+- `OneloConfig(language = …)`: the App's language. `null` (default) uses the device language. It is asked for with `/api/sdk/config` (with the device locales as `Accept-Language`) and is the default `lang` of the sign-in, store, upgrade, consent and waitlist calls. The backend answers `page_language`, chosen within the App Languages; the SDK adopts it and keeps it for the next launch's first screen (#1075).
+- `onelo.auth.pageLanguage`: the Page Language the SDK's texts are drawn in ("en" until the backend first answers) (#1075).
+
+### Changed
+
+- Feature badges use the hosted pages' words: `COMING_SOON` reads "Coming soon" (was "Coming Soon") and an `UPSELL` without a plan name reads "Change plan" (was "Upgrade"), the same words as the hosted feature-lock page and the Store (#1075).
+- Messages of the `OneloError`s listed above are in the Page Language. Messages that address the developer (invalid key, hosted flow required, email verification off, server diagnostics) stay English. Branch on `OneloError.code`, never on the message (#1075).
+
+## [1.60.0] — 2026-11-18
+
+### Added
+
+- `waitlist.join(email, slug, consent, language)` sends the device language, or the `language` the App passes (sent unchanged); `language` is `String?` defaulting to `null`. The backend stores the Page Language of the sign-up (one of the App Languages) on the waitlist entry for the waitlist emails (#1038).
+
+## [1.59.0] — 2026-11-18
+
+### Changed
+
+- `paywall.initiateStoreFlow()`, `onelo.openUpgrade()` and `auth.resolveFlow()` send the device language when the App passes none, instead of `en` (or nothing for the sign-in flow); `lang` is now `String?` defaulting to `null`. A language the App passes is sent unchanged (#1039). The backend picks the Page Language within the App Languages; the SDK only sends the language.
+
+## [1.58.0] — 2026-11-18
+
+### Changed
+
+- `requiredConsents()` sends the device language. Each item's `url` and `consentUrl` open the document in the App User's language when the App offers it and a version in that language exists, else in the document's main language (#1073). The backend chooses; the SDK only sends the language.
+
 ## [1.57.0] — 2026-10-23
 
 ### Added

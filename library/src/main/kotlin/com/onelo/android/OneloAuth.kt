@@ -120,10 +120,20 @@ class OneloAuth internal constructor(
     var signupMarketingConsent: OneloSignupMarketingConsent = OneloSignupMarketingConsent.NOT_ASKED
         private set
 
+    /** #1075 — the Page Language the SDK's own texts are drawn in ("de", "pl", …):
+     *  [OneloConfig.language] when it is one of the App Languages, else the device
+     *  language when it is one, else the App's default. Onelo chooses it and
+     *  `/api/sdk/config` answers it; until then the one kept from the last launch,
+     *  else "en". */
+    val pageLanguage: String
+        get() = OneloPageLanguage.current
+
     init {
         require(config.apiUrl.isNotBlank()) { "[Onelo] apiUrl is required" }
         require(config.publishableKey.isNotBlank()) { "[Onelo] publishableKey is required" }
         requireSecureApiUrl(config.apiUrl)
+        // #1075 — first paint in the language the last launch was answered.
+        OneloPageLanguage.restore(storage)
         scope.launch { initialize() }
     }
 
@@ -138,9 +148,11 @@ class OneloAuth internal constructor(
             pkceVerifier = verifier
             val challenge = Pkce.generateCodeChallenge(verifier)
             // #818: `lang` puts the sign-up Marketing Consent text in the device language.
-            val url = "${config.apiUrl}/api/sdk/config?key=${enc(config.publishableKey)}&code_challenge=${enc(challenge)}" +
-                "&lang=${enc(OneloSignupMarketingConsent.deviceLanguage())}"
-            val resp = HttpClient.get(url, baseHeaders())
+            // #1075: the App's language, else the device language; the device locales
+            // ride as Accept-Language so the backend can fall back to the next one the
+            // App offers before its default. It answers `page_language`.
+            val url = configUrl(config.apiUrl, config.publishableKey, challenge, config.requestLanguage())
+            val resp = HttpClient.get(url, configHeaders(baseHeaders(), OneloPageLanguage.deviceLanguageTags()))
             if (resp.status == 401 || resp.status == 404) {
                 isRevoked = true
                 throw OneloError.invalidKey("Server rejected the key")
@@ -161,6 +173,8 @@ class OneloAuth internal constructor(
             @Suppress("UNCHECKED_CAST")
             oauthProviders = (resp.body["oauth_providers"] as? List<Any?>)?.filterIsInstance<String>() ?: emptyList()
             signupMarketingConsent = OneloSignupMarketingConsent.fromConfig(resp.body)
+            // #1075 — the Page Language the SDK's own texts are drawn in (Python chose it).
+            OneloPageLanguage.adoptFromConfig(resp.body, storage)
 
             // Attestation, now that config resolved attest_required + cloud project number.
             if (resp.body["attest_required"] as? Boolean == true) {
@@ -398,16 +412,17 @@ class OneloAuth internal constructor(
      * rejected device over with a sign-in form hides the real problem.
      *
      * Mirrors Swift `resolveFlow`, RN `_decisionFromFlow`, JS/Electron `resolveFlow`.
+     *
+     * @param lang The App's language for the sign-in page. `null` (default) sends
+     *             [OneloConfig.language], else the device language (#1039, #1075);
+     *             the backend picks the Page Language.
      */
     suspend fun resolveFlow(lang: String? = null): FlowDecision {
-        val langParam = lang?.let { "&lang=${enc(it)}" } ?: ""
         val resp = HttpClient.get(
-            "${config.apiUrl}/api/sdk/flow/init?key=${enc(config.publishableKey)}" +
-                "&callback_scheme=${enc(config.callbackScheme)}$langParam" +
-                // Binds the flow token to this install. It is also what pairs a
-                // magic link the hosted page sends: opened on another device, the
-                // link shows a code screen and the sign-in completes here (#540).
-                "&code_challenge=${enc(flowPkce.begin())}",
+            // The code challenge binds the flow token to this install. It is also
+            // what pairs a magic link the hosted page sends: opened on another
+            // device, the link shows a code screen and the sign-in completes here (#540).
+            flowInitUrl(config.apiUrl, config.publishableKey, config.callbackScheme, config.requestLanguage(lang), flowPkce.begin()),
             // Bearer when signed in — without it the backend can only ever answer
             // "sign_in", which is exactly the blindness this replaces.
             baseHeaders(bearer = currentSession?.accessToken)
@@ -430,6 +445,30 @@ class OneloAuth internal constructor(
     }
 
     companion object {
+        /** `GET /api/sdk/config` — #1075: [lang] is the App's language, else the
+         *  device language. Pure, so the query is testable on the JVM. */
+        internal fun configUrl(apiUrl: String, publishableKey: String, codeChallenge: String, lang: String): String =
+            "$apiUrl/api/sdk/config?key=${URLEncoder.encode(publishableKey, "UTF-8")}" +
+                "&code_challenge=${URLEncoder.encode(codeChallenge, "UTF-8")}" +
+                "&lang=${URLEncoder.encode(lang, "UTF-8")}"
+
+        /** The config request's headers: [base] plus the device locales as
+         *  `Accept-Language` (#1075), the backend's next choice of Page Language. */
+        internal fun configHeaders(base: Map<String, String>, deviceTags: List<String>): Map<String, String> {
+            val accept = OneloPageLanguage.acceptLanguage(deviceTags) ?: return base
+            return base + ("Accept-Language" to accept)
+        }
+
+        /** `GET /api/sdk/flow/init` — #1039: the App's language, else the device
+         *  language. Pure, so the query is testable on the JVM. */
+        internal fun flowInitUrl(
+            apiUrl: String, publishableKey: String, callbackScheme: String, lang: String?, codeChallenge: String,
+        ): String =
+            "$apiUrl/api/sdk/flow/init?key=${URLEncoder.encode(publishableKey, "UTF-8")}" +
+                "&callback_scheme=${URLEncoder.encode(callbackScheme, "UTF-8")}" +
+                "&lang=${URLEncoder.encode(lang ?: OneloSignupMarketingConsent.deviceLanguage(), "UTF-8")}" +
+                "&code_challenge=${URLEncoder.encode(codeChallenge, "UTF-8")}"
+
         /** The `/hosted-callback` body. Pure, so the verifier choice is testable. */
         internal fun hostedCallbackBody(publishableKey: String, code: String, verifier: String?): Map<String, Any?> =
             buildMap {

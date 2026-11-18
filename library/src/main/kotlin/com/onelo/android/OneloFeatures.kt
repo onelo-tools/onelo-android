@@ -71,21 +71,22 @@ class OneloFeatureHandle internal constructor(private val resolved: ResolvedFeat
     fun isNew(): Boolean = status == FeatureStatus.NEW
     fun isBeta(): Boolean = status == FeatureStatus.BETA
     fun isComingSoon(): Boolean = status == FeatureStatus.COMING_SOON
-    /** Promo/lock badge (parity with Swift/JS/RN/Electron): "New"/"Beta"/"Coming Soon",
+    /** Promo/lock badge (parity with Swift/JS/RN/Electron): "New"/"Beta"/"Coming soon" (in the Page Language, #1075),
      *  "🔒" for GREYED (locked — the dashboard's "Visible with a padlock" fallback; NEVER
      *  hide it), and "Available in <plan>" for UPSELL. Null for the rest. Render it next
      *  to the feature so a gated user sees the padlock / hint the backend sent. Previously
      *  GREYED + UPSELL returned null, silently dropping the padlock + upgrade prompt. */
     val badgeLabel: String? get() = when (status) {
-        FeatureStatus.NEW         -> "New"
-        FeatureStatus.BETA        -> "Beta"
-        FeatureStatus.COMING_SOON -> "Coming Soon"
+        // #1075 — Onelo's words in the Page Language; the plan name as written.
+        FeatureStatus.NEW         -> OneloText.BADGE_NEW.text()
+        FeatureStatus.BETA        -> OneloText.BADGE_BETA.text()
+        FeatureStatus.COMING_SOON -> OneloText.BADGE_COMING_SOON.text()
         FeatureStatus.GREYED      -> "🔒"
         // Prefer the human product name; the bare slug only as a stopgap for older
         // backends. Empty label must NOT shadow a valid slug (Swift OneloSDKTypes.swift:76-78).
         FeatureStatus.UPSELL      ->
             (requiredPlanLabel?.takeIf { it.isNotBlank() } ?: requiredPlan?.takeIf { it.isNotBlank() })
-                ?.let { "Available in $it" } ?: "Upgrade"
+                ?.let { OneloText.BADGE_AVAILABLE_IN.text("plan" to it) } ?: OneloText.BADGE_UPGRADE.text()
         else                      -> null
     }
 

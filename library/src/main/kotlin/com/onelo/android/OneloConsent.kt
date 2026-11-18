@@ -10,6 +10,7 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import com.onelo.android.internal.HttpClient
 import java.lang.ref.WeakReference
+import java.net.URLEncoder
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -292,6 +293,19 @@ class OneloConsent(
 
     // ── Data API (mirrors Swift requiredConsents / acceptConsent) ────────────
 
+    internal companion object {
+        /**
+         * #1073 — `GET /v1/sdk/consent/required` with the App's language
+         * ([OneloConfig.language], #1075), else the device language. The
+         * backend picks the Page Language (within the App Languages) and links
+         * each legal document in it; the SDK never chooses.
+         */
+        internal fun consentRequiredUrl(
+            apiUrl: String,
+            language: String = OneloSignupMarketingConsent.deviceLanguage(),
+        ): String = "$apiUrl/v1/sdk/consent/required?lang=${URLEncoder.encode(language, "UTF-8")}"
+    }
+
     /**
      * Fetch the signed-in user's outstanding legal documents. Requires a
      * session; returns `emptyList()` when signed out. Fail-open: any
@@ -305,7 +319,7 @@ class OneloConsent(
             // out of presentGateIfNeeded and strand the gate reservation. Fail-open.
             val session = auth.getSession() ?: return emptyList()
             val resp = HttpClient.get(
-                url = "${config.apiUrl}/v1/sdk/consent/required",
+                url = consentRequiredUrl(config.apiUrl, config.requestLanguage()),
                 headers = consentHeaders(session.accessToken),
             )
             if (resp.status != 200) return emptyList()

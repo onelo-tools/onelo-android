@@ -15,15 +15,18 @@ class OneloWaitlist(
     /**
      * Join a waitlist. [consent] (#818): the checkboxes your form showed —
      * Marketing Consent and the waitlist's custom checkbox. Omitted, none is sent.
+     * [language] (#1038): the App's language for this sign-up. `null` (default)
+     * sends [OneloConfig.language], else the device language (#1075); the backend stores the join's Page Language
+     * (one of the App Languages) for the waitlist emails.
      */
-    suspend fun join(email: String, slug: String? = null, consent: OneloWaitlistConsent? = null): WaitlistResult {
+    suspend fun join(
+        email: String,
+        slug: String? = null,
+        consent: OneloWaitlistConsent? = null,
+        language: String? = null,
+    ): WaitlistResult {
         return try {
-            val body = mutableMapOf<String, Any?>(
-                "publishableKey" to config.publishableKey,
-                "email" to email,
-            )
-            if (slug != null) body["slug"] = slug
-            consent?.wireValue()?.let { body["consent"] = it }
+            val body = joinBody(config.publishableKey, email, slug, consent, config.requestLanguage(language))
             val headers = mapOf(
                 "X-Publishable-Key" to config.publishableKey,
                 "X-SDK-Version" to SDK_VERSION,
@@ -37,6 +40,27 @@ class OneloWaitlist(
             WaitlistResult(success = success, position = position, alreadyJoined = alreadyJoined)
         } catch (e: Exception) {
             WaitlistResult(success = false)
+        }
+    }
+
+    internal companion object {
+        /** `POST /api/sdk/waitlist/join` body. Pure, so the wire is testable on the JVM. */
+        internal fun joinBody(
+            publishableKey: String,
+            email: String,
+            slug: String?,
+            consent: OneloWaitlistConsent?,
+            language: String?,
+        ): Map<String, Any?> {
+            val body = mutableMapOf<String, Any?>(
+                "publishableKey" to publishableKey,
+                "email" to email,
+                // #1038: the App's language, else the device language.
+                "language" to (language ?: OneloSignupMarketingConsent.deviceLanguage()),
+            )
+            if (slug != null) body["slug"] = slug
+            consent?.wireValue()?.let { body["consent"] = it }
+            return body
         }
     }
 }

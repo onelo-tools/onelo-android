@@ -61,18 +61,18 @@ class OneloPaywall(
      * Initiate the hosted Store flow and return its URL. Present it in a WebView
      * (e.g. push an Activity hosting one). Mirrors Swift `initiateStoreFlow`.
      *
-     * @param lang   Language for the hosted store (e.g. "en"). Default "en".
+     * @param lang   The App's language for the hosted store. `null` (default) sends
+     *               [OneloConfig.language], else the device language (#1039,
+     *               #1075); the backend picks the Page
+     *               Language within the App Languages.
      * @param token  Optional access token from the signed-in [OneloSession]
      *               (`onelo.auth.currentSession?.accessToken`) — pass it so a
      *               returning buyer goes straight to checkout instead of re-auth.
      * @return       The hosted `store_url` to load.
      * @throws [OneloError] on network failure or a non-200 response.
      */
-    suspend fun initiateStoreFlow(lang: String = "en", token: String? = null): String {
-        val url = "${config.apiUrl}/api/sdk/paywall/store-initiate" +
-            "?key=${enc(config.publishableKey)}" +
-            "&callback_scheme=${enc(config.callbackScheme)}" +
-            "&lang=${enc(lang)}"
+    suspend fun initiateStoreFlow(lang: String? = null, token: String? = null): String {
+        val url = storeInitiateUrl(config.apiUrl, config.publishableKey, config.callbackScheme, config.requestLanguage(lang))
         val headers = mutableMapOf("X-SDK-Version" to SDK_VERSION)
         token?.let { headers["Authorization"] = "Bearer $it" }
         // TOFU security headers — store-initiate runs validate_sdk_request_security,
@@ -96,7 +96,15 @@ class OneloPaywall(
             ?: throw OneloError.server("store-initiate response missing store_url")
     }
 
-    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+    internal companion object {
+        /** `GET /api/sdk/paywall/store-initiate` — #1039: the App's language,
+         *  else the device language. Pure, so the query is testable on the JVM. */
+        internal fun storeInitiateUrl(apiUrl: String, publishableKey: String, callbackScheme: String, lang: String?): String =
+            "$apiUrl/api/sdk/paywall/store-initiate" +
+                "?key=${URLEncoder.encode(publishableKey, "UTF-8")}" +
+                "&callback_scheme=${URLEncoder.encode(callbackScheme, "UTF-8")}" +
+                "&lang=${URLEncoder.encode(lang ?: OneloSignupMarketingConsent.deviceLanguage(), "UTF-8")}"
+    }
 
     // ------------------------------------------------------------------
     // cancelSubscription — calls the Onelo backend portal-cancel endpoint.

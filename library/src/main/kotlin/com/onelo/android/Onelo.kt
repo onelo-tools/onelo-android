@@ -205,18 +205,14 @@ class Onelo(private val config: OneloConfig, context: Context) {
      * hosted auth flow via `auth.loadAuthView(...)` — the hosted page routes
      * sign-up → store server-side (parity with Swift `OneloAuthView`).
      */
-    suspend fun openUpgrade(plan: String, lang: String = "en") {
+    suspend fun openUpgrade(plan: String, lang: String? = null) {
         val token = auth.getSession()?.accessToken
         if (token == null) {
             Log.w("Onelo", "openUpgrade: no signed-in user — upgrade flow requires a session")
             return
         }
         val upgradeUrl = try {
-            val url = "${config.apiUrl}/api/sdk/paywall/upgrade-initiate" +
-                "?key=${enc(config.publishableKey)}" +
-                "&plan=${enc(plan)}" +
-                "&callback_scheme=${enc(config.callbackScheme)}" +
-                "&lang=${enc(lang)}"
+            val url = upgradeInitiateUrl(config.apiUrl, config.publishableKey, plan, config.callbackScheme, config.requestLanguage(lang))
             val resp = HttpClient.get(
                 url,
                 // securityHeaders() (X-Onelo-Instance-Id + X-Bundle-Id + X-Integrity-Token)
@@ -351,5 +347,16 @@ class Onelo(private val config: OneloConfig, context: Context) {
         }
     }
 
-    private fun enc(s: String): String = URLEncoder.encode(s, "UTF-8")
+    internal companion object {
+        /** `GET /api/sdk/paywall/upgrade-initiate` — #1039: the App's language,
+         *  else the device language. Pure, so the query is testable on the JVM. */
+        internal fun upgradeInitiateUrl(
+            apiUrl: String, publishableKey: String, plan: String, callbackScheme: String, lang: String?,
+        ): String =
+            "$apiUrl/api/sdk/paywall/upgrade-initiate" +
+                "?key=${URLEncoder.encode(publishableKey, "UTF-8")}" +
+                "&plan=${URLEncoder.encode(plan, "UTF-8")}" +
+                "&callback_scheme=${URLEncoder.encode(callbackScheme, "UTF-8")}" +
+                "&lang=${URLEncoder.encode(lang ?: OneloSignupMarketingConsent.deviceLanguage(), "UTF-8")}"
+    }
 }

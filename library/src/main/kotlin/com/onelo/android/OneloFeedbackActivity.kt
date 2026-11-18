@@ -142,7 +142,7 @@ class OneloFeedbackActivity : AppCompatActivity() {
             setPadding(touchPadding, touchPadding, touchPadding, touchPadding)
             isClickable = true
             isFocusable = true
-            contentDescription = "Close"
+            contentDescription = OneloText.CLOSE.text() // #1075 — Page Language
             visibility = View.GONE // fail-safe only — armed by the grace timer below
             setOnClickListener {
                 setResult(Activity.RESULT_CANCELED)

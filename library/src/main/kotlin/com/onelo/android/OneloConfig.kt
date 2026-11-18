@@ -63,4 +63,22 @@ data class OneloConfig(
      * (Swift's `_resyncOnLifecycle`). Set false to rely solely on the poll + SSE.
      */
     val autoLifecycleRefresh: Boolean = true,
-)
+    /**
+     * #1075 — the App's language for the App User (a BCP 47 tag such as "de" or
+     * "pt-PT"), e.g. the language your own UI is set to. `null` (default) uses the
+     * device language. Onelo picks the **Page Language** from it: this language
+     * when it is one of your App Languages, else the device language when it is
+     * one, else your App's default. The SDK's own texts ("Close", "Try again",
+     * feature badges, error messages) and the hosted pages it opens use that
+     * language. A `lang` passed to a single call wins for that call's page.
+     */
+    val language: String? = null,
+) {
+    /** The language a request asks the backend with: the call's own [lang], else
+     *  the App's [language], else the device language. Never chosen here — the
+     *  backend picks the Page Language within the App Languages. */
+    internal fun requestLanguage(lang: String? = null): String =
+        lang?.takeIf { it.isNotBlank() }
+            ?: language?.takeIf { it.isNotBlank() }
+            ?: OneloSignupMarketingConsent.deviceLanguage()
+}

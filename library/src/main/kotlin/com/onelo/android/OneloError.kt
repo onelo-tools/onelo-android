@@ -48,22 +48,22 @@ class OneloError(
         INVALID_VERIFY_REDIRECT,
     }
 
+    // #1075 — messages an App User may be shown are in the Page Language
+    // (OneloText); messages that address the developer (a key, a configuration,
+    // server diagnostics) stay English. Branch on [code], never on the message.
     companion object {
-        fun notAuthenticated() = OneloError(Code.NOT_AUTHENTICATED, "User is not authenticated")
+        fun notAuthenticated() = OneloError(Code.NOT_AUTHENTICATED, OneloText.ERROR_NOT_AUTHENTICATED.text())
         fun notEntitled() = OneloError(Code.NOT_ENTITLED, "User is not entitled to this module")
         fun hostedFlowRequired() = OneloError(Code.HOSTED_FLOW_REQUIRED, "This app requires the hosted sign-in flow. Use loadAuthView().")
         fun planRequired() = OneloError(Code.PLAN_REQUIRED, "[plan_required] Custom UI requires a paid Onelo plan. Use loadAuthView() instead.")
         fun invalidKey(msg: String) = OneloError(Code.INVALID_PUBLISHABLE_KEY, "Invalid publishable key: $msg")
-        fun network(msg: String) = OneloError(Code.NETWORK_ERROR, "Network error: $msg")
+        fun network(msg: String) = OneloError(Code.NETWORK_ERROR, OneloText.ERROR_NETWORK.text("detail" to msg))
         fun server(msg: String) = OneloError(Code.SERVER_ERROR, msg)
-        fun cancelled() = OneloError(Code.CANCELLED, "Sign in was cancelled")
+        fun cancelled() = OneloError(Code.CANCELLED, OneloText.ERROR_CANCELLED.text())
         fun revoked() = OneloError(Code.REVOKED, "This application has been revoked")
-        fun userRevoked() = OneloError(Code.USER_REVOKED, "This user account has been suspended")
-        fun sessionEnded() = OneloError(Code.SESSION_ENDED, "Your session ended — please sign in again")
-        fun noActivePlan() = OneloError(
-            Code.NO_ACTIVE_PLAN,
-            "No active subscription — the plan has expired or was cancelled.",
-        )
+        fun userRevoked() = OneloError(Code.USER_REVOKED, OneloText.ERROR_USER_REVOKED.text())
+        fun sessionEnded() = OneloError(Code.SESSION_ENDED, OneloText.ERROR_SESSION_ENDED.text())
+        fun noActivePlan() = OneloError(Code.NO_ACTIVE_PLAN, OneloText.ERROR_NO_ACTIVE_PLAN.text())
         @Deprecated("Secure Mode is retired; the SDK never raises this.")
         @Suppress("DEPRECATION")
         fun secureModeRequired() = OneloError(Code.SECURE_MODE_REQUIRED, "Secure Mode is retired.")
@@ -77,13 +77,13 @@ class OneloError(
             val code = extractErrorCode(body)
             return when {
                 status == 429 || code == "verification_rate_limited" ->
-                    OneloError(Code.VERIFICATION_RATE_LIMITED, "At most 3 verification emails an hour — try again later")
+                    OneloError(Code.VERIFICATION_RATE_LIMITED, OneloText.ERROR_VERIFICATION_RATE_LIMITED.text())
                 status == 409 || code == "email_verification_off" ->
                     OneloError(Code.EMAIL_VERIFICATION_OFF, "Email verification is off for this app — turn it on in Auth → Sign-up")
                 status == 400 && code == "invalid_verify_redirect_to" ->
                     OneloError(Code.INVALID_VERIFY_REDIRECT, "redirectTo must be one of this app's allowed web origins or <your-scheme>://…")
                 status == 400 && code == "invalid_token" ->
-                    OneloError(Code.INVALID_VERIFICATION_TOKEN, "This verification link is invalid, already used, replaced by a newer one, or expired")
+                    OneloError(Code.INVALID_VERIFICATION_TOKEN, OneloText.ERROR_INVALID_VERIFICATION_TOKEN.text())
                 status == 401 -> notAuthenticated()
                 else -> server("Email verification request failed: HTTP $status")
             }

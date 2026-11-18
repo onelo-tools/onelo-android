@@ -120,6 +120,10 @@ lifecycleScope.launch {
 
 Feature flags follow the signed-in Onelo user automatically: every Features call sends that user's access token, so the server knows who is asking. There is nothing to identify. `identify()` and its `userIdHash` argument still compile but are deprecated, and `userIdHash` is no longer sent.
 
+### Language
+
+The SDK's own texts ("Close", "Try again", the feature badges such as "Coming soon" and "Available in Pro", error messages) and the hosted pages it opens use the App User's Page Language. That is the language you pass with `OneloConfig(language = "de")` when it is one of your App Languages, otherwise the device language when it is one, otherwise your App's default. Onelo chooses it and translates its own texts into English, Polish, German, French, Spanish, Italian, Portuguese and Dutch. Your own content (app name, plan names, your texts) is shown as written. `onelo.auth.pageLanguage` tells you the language chosen. Branch on `OneloError.code`, not on its message: messages an App User may see are translated.
+
 ## Security
 
 - **Tokens are stored in `EncryptedSharedPreferences`** (AES256-SIV keys, AES256-GCM values) — never plain SharedPreferences.
